@@ -1,6 +1,7 @@
 import telebot
+import os
 
-TOKEN = 'YOUR_BOT_TOKEN'
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
 @bot.message_handler(commands=['start'])
@@ -9,6 +10,8 @@ def send_welcome(message):
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
-    bot.reply_to(message, "🔮 Обрабатываю твоё фото... (демо-режим)")
+    bot.reply_to(message, "🧚‍♀️ Обрабатываю твоё фото... (демо-режим)")
 
 print("Бот запущен. Ожидает команды...")
+
+bot.infinity_polling()
