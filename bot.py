@@ -48,6 +48,7 @@ async def handle_photo(message: types.Message):
 
     await bot.send_photo(chat_id=message.chat.id, photo=InputFile(placeholder), caption="Вот результат!")
     os.remove(file_path)
+    await message.answer_photo(types.InputFile(result_path))
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
