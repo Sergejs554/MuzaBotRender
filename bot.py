@@ -11,6 +11,9 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
+# Состояние выбранного режима
+user_mode = {}
+
 # Хэндлер старта
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
@@ -19,15 +22,14 @@ async def start(message: types.Message):
     keyboard.add(*buttons)
     await message.answer("Привет! Выбери режим обработки:", reply_markup=keyboard)
 
-# Состояние выбранного режима
-user_mode = {}
-
+# Выбор режима
 @dp.message_handler(lambda message: message.text in ["📸 Make It Special", "🌿 Nature"])
 async def choose_mode(message: types.Message):
     mode = "face" if message.text == "📸 Make It Special" else "nature"
     user_mode[message.from_user.id] = mode
     await message.reply("Отправь фото для обработки!")
 
+# Обработка фото
 @dp.message_handler(content_types=types.ContentType.PHOTO)
 async def handle_photo(message: types.Message):
     mode = user_mode.get(message.from_user.id)
@@ -40,15 +42,21 @@ async def handle_photo(message: types.Message):
     await photo.download(destination_file=file_path)
 
     result_path = f"output_{message.from_user.id}.jpg"
-    # Обработка: подмена на заглушку (настоящую обработку подключим позже)
+
+    # Подмена на заглушку
     if mode == "face":
         placeholder = "samples/face_example.jpg"
     else:
         placeholder = "samples/nature_example.jpg"
 
-    await bot.send_photo(chat_id=message.chat.id, photo=InputFile(placeholder), caption="Вот результат!")
+    # Копируем заглушку как будто это результат
+    with open(placeholder, "rb") as src, open(result_path, "wb") as dst:
+        dst.write(src.read())
+
+    await bot.send_photo(chat_id=message.chat.id, photo=InputFile(result_path), caption="Вот результат!")
+    
     os.remove(file_path)
-    await message.answer_photo(types.InputFile(result_path))
+    os.remove(result_path)
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
