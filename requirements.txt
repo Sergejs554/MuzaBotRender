@@ -1,3 +1,11 @@
-pyTelegramBotAPI==4.13.0
+# Telegram
 aiogram==2.25.1
-Pillow
+
+# Imaging / CV
+numpy<2.0
+opencv-python-headless>=4.8.0.74
+mediapipe==0.10.14
+pillow>=9.5.0
+
+# (опционально, если где-то используешь)
+# scikit-image>=0.22.0
