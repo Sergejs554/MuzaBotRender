@@ -110,60 +110,13 @@ KB = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-@dp.message_handler(commands=["start"])
-async def on_start(m: types.Message):
-    await m.answer(
-        "Привет ✨ Природные кадры улучшим на максимум.\n"
-        "Выбери режим ниже. Для Flux можно прислать только текст (промпт).",
-        reply_markup=KB
-    )
-
-@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance", "🌄 Epic Landscape Flux", "🏞 Ultra HDR", "📸 Clean Restore"])
-async def on_choose(m: types.Message):
-    uid = m.from_user.id
-    if "Nature Enhance" in m.text:
-        WAIT[uid] = {"effect": "nature"}
-        await m.answer("Ок! Пришли фото. ⛰️🌿")
-    elif "Epic Landscape Flux" in m.text:
-        WAIT[uid] = {"effect": "flux"}
-        await m.answer("Пришли описание сцены (можно без фото) — сгенерю эпик‑ландшафт.")
-    elif "Ultra HDR" in m.text:
-        WAIT[uid] = {"effect": "hdr"}
-        await m.answer("Пришли фото. Можно приложить подпись — усилю сцену в стиле HDR.")
-    elif "Clean Restore" in m.text:
-        WAIT[uid] = {"effect": "clean"}
-        await m.answer("Пришли фото. Уберу шум/мыло и аккуратно детализирую.")
-
-
-    @dp.message_handler(content_types=["photo"])
+ @dp.message_handler(content_types=["photo"])
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     state = WAIT.get(uid)
     if not state:
         await m.reply("Выбери режим на клавиатуре ниже и затем пришли фото.", reply_markup=KB)
         return
-
-    effect = state.get("effect")
-    caption = (m.caption or "").strip()
-
-    await m.reply("⏳ Обрабатываю...")
-    try:
-        # 👉 получаем пригодный для моделей URL через Replicate Storage
-        rep_url = await telegram_file_to_replicate_url(bot, m.photo[-1].file_id)
-
-        if effect == "nature":
-            out_url = run_nature_enhance(rep_url)
-        elif effect == "flux":
-            out_url = run_epic_landscape_flux(prompt_text=caption)
-        elif effect == "hdr":
-            out_url = run_ultra_hdr(rep_url, hint_caption=caption)
-        elif effect == "clean":
-            out_url = run_clean_restore(rep_url)
-        else:
-            raise RuntimeError("Unknown effect")
-
-        await m.reply_photo(out_url)
-
     except Exception:
         tb = traceback.format_exc(limit=20)
         await m.reply(f"🔥 Ошибка {effect}:\n```\n{tb}\n```", parse_mode="Markdown")
