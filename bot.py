@@ -88,7 +88,7 @@ def run_nature_enhance(public_url: str) -> str:
     """
     ref_inputs = {
         "image": public_url,
-        "prompt": "Ultra HDR natural realistic by reference witj streight 0.65 ,but deep color balance, clean details, no artifacts, no extra objects"
+        "prompt": "Ultra HDR natural reference stranght 0.65 but deep color balance, clean details, no artifacts, no extra objects"    
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     ref_url = pick_url(ref_out)
