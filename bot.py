@@ -1,20 +1,21 @@
-# bot.py — Nature Inspire (Replicate)
+# bot.py — Nature Inspire (Replicate) — FIXED loop + safe send
 
 import os
 import logging
-import traceback
-import tempfile
-import urllib.request
-
 import replicate
+import asyncio
+import traceback
+import urllib.request
+import tempfile
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InputFile
 from aiogram.utils import executor
 
 logging.basicConfig(level=logging.INFO)
 
-# ===== TOKENS =====
-API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
+# ---------- TOKENS ----------
+API_TOKEN  = os.getenv("TELEGRAM_API_TOKEN")
 REPL_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("TELEGRAM_API_TOKEN")
@@ -25,21 +26,27 @@ os.environ["REPLICATE_API_TOKEN"] = REPL_TOKEN  # для SDK
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# ===== MODELS =====
+# ---------- MODELS ----------
 MODEL_FLUX    = "black-forest-labs/flux-1.1-pro"
 MODEL_REFINER = "fermatresearch/magic-image-refiner:507ddf6f977a7e30e46c0daefd30de7d563c72322f9e4cf7cbac52ef0f667b13"
 MODEL_ESRGAN  = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
 MODEL_SWINIR  = "jingyunliang/swinir:660d922d33153019e8c263a3bba265de882e7f4f70396546b6c9c8f9d47a021a"
 
-# ===== STATE =====
-WAIT = {}  # user_id -> {'effect': ...}
+# ---------- STATE ----------
+WAIT = {}  # user_id -> {'effect': 'nature'|'flux'|'hdr'|'clean'}
 
-def tg_file_url(file_path: str) -> str:
-    """Собрать прямой URL на файл Telegram (для скачивания нашим кодом)."""
+# ---------- HELPERS ----------
+def tg_public_url(file_path: str) -> str:
+    """Публичная ссылка Telegram‑файла (подходит для Replicate как input)."""
     return f"https://api.telegram.org/file/bot{API_TOKEN}/{file_path}"
 
-def pick_url(output):
-    """Аккуратно достаём URL из ответа Replicate (строка / список / Blob с .url)."""
+async def telegram_file_to_public_url(file_id: str) -> str:
+    """ASYNC! Берём путь к файлу и превращаем в публичный URL для Replicate."""
+    tg_file = await bot.get_file(file_id)
+    return tg_public_url(tg_file.file_path)
+
+def pick_url(output) -> str:
+    """Надёжно достаём URL из разных форматов ответа Replicate."""
     try:
         if isinstance(output, str):
             return output
@@ -54,38 +61,34 @@ def pick_url(output):
     except Exception:
         return str(output)
 
-def telegram_file_to_replicate_url(file_id: str) -> str:
+def download_to_temp(url: str) -> str:
+    """Скачиваем картинку по URL во временный файл, возвращаем путь."""
+    fd, path = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    urllib.request.urlretrieve(url, path)
+    return path
+
+async def send_image_by_url(m: types.Message, url: str):
     """
-    Скачиваем фото из Telegram во временный файл и загружаем на Replicate Delivery,
-    возвращаем стабильный https-URL (подходит абсолютно для всех моделей).
+    Чтобы не ловить 'Failed to get http url content', скачиваем и шлём как файл.
     """
-    tmp_path = None
+    path = None
     try:
-        tg_file = bot.loop.run_until_complete(bot.get_file(file_id))
-        public_src = tg_file_url(tg_file.file_path)
-
-        fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-        os.close(fd)
-        urllib.request.urlretrieve(public_src, tmp_path)
-
-        # Важно: используем официальный аплоад SDK
-        uploaded = replicate.files.upload(tmp_path)  # -> https://replicate.delivery/...
-        return uploaded
+        path = download_to_temp(url)
+        await m.reply_photo(InputFile(path))
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        if path and os.path.exists(path):
+            os.remove(path)
 
 # ===================== PIPELINES =====================
 
-def run_nature_enhance(replicate_url: str) -> str:
-    """🌿 Refiner → ESRGAN x2."""
+def run_nature_enhance(public_url: str) -> str:
+    """
+    🌿 Nature Enhance = Magic Image Refiner -> ESRGAN x2
+    """
     ref_inputs = {
-        "image": replicate_url,
+        "image": public_url,
         "prompt": "natural color balance, clean details, no artifacts, no extra objects"
-        # если появится параметр силы у конкретной версии — добавим его здесь
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     ref_url = pick_url(ref_out)
@@ -94,7 +97,9 @@ def run_nature_enhance(replicate_url: str) -> str:
     return pick_url(esr_out)
 
 def run_epic_landscape_flux(prompt_text: str) -> str:
-    """🌄 Генерация по тексту (без входного фото)."""
+    """
+    🌄 Epic Landscape Flux = чистая генерация по тексту.
+    """
     if not prompt_text or not prompt_text.strip():
         prompt_text = (
             "epic panoramic landscape, dramatic sky, volumetric light, ultra-detailed mountains, "
@@ -103,21 +108,27 @@ def run_epic_landscape_flux(prompt_text: str) -> str:
     flux_out = replicate.run(MODEL_FLUX, input={"prompt": prompt_text, "prompt_upsampling": True})
     return pick_url(flux_out)
 
-def run_ultra_hdr(hint_caption: str = "") -> str:
-    """🏞 Flux с HDR-подсказкой → ESRGAN x2."""
-    prompt_text = hint_caption.strip() if hint_caption else "Ultra HDR, realistic nature photo, same scene look, rich dynamic range"
+def run_ultra_hdr(_public_url_ignored: str, hint_caption: str = "") -> str:
+    """
+    🏞 Ultra HDR = Flux по HDR-шаблону (capion как подсказка) -> ESRGAN x2.
+    (FLUX 1.1 Pro не принимает image2image, поэтому фото тут выступает как контекст,
+     а преобразование делаем текстом, затем апскейлим.)
+    """
+    prompt_text = hint_caption.strip() if hint_caption else (
+        "Ultra HDR nature photo of the same scene, rich dynamic range, crisp details, "
+        "deep shadows, highlight recovery, realistic colors, professional photography"
+    )
     flux_out = replicate.run(MODEL_FLUX, input={"prompt": prompt_text, "prompt_upsampling": True})
     flux_url = pick_url(flux_out)
 
     esr_out = replicate.run(MODEL_ESRGAN, input={"image": flux_url, "scale": 2})
     return pick_url(esr_out)
 
-def run_clean_restore(replicate_url: str) -> str:
-    """📸 SwinIR (мягкая чистка) → ESRGAN x2."""
-    swin_out = replicate.run(
-        MODEL_SWINIR,
-        input={"image": replicate_url, "jpeg": "40", "noise": "15"}
-    )
+def run_clean_restore(public_url: str) -> str:
+    """
+    📸 Clean Restore = SwinIR (шум/мыло) -> ESRGAN x2.
+    """
+    swin_out = replicate.run(MODEL_SWINIR, input={"image": public_url, "jpeg": "40", "noise": "15"})
     swin_url = pick_url(swin_out)
 
     esr_out = replicate.run(MODEL_ESRGAN, input={"image": swin_url, "scale": 2})
@@ -139,7 +150,7 @@ KB = ReplyKeyboardMarkup(
 async def on_start(m: types.Message):
     await m.answer(
         "Привет ✨ Природные кадры улучшим на максимум.\n"
-        "Выбери режим ниже. Для Flux можно прислать только текст (без фото).",
+        "Выбери режим ниже, затем пришли фото (для Flux-генерации можно прислать только текст в подписи).",
         reply_markup=KB
     )
 
@@ -151,13 +162,13 @@ async def on_choose(m: types.Message):
         await m.answer("Ок! Пришли фото. ⛰️🌿")
     elif "Epic Landscape Flux" in m.text:
         WAIT[uid] = {"effect": "flux"}
-        await m.answer("Пришли *текст-описание* пейзажа (или просто отправь текстом) — сгенерю кадр.", parse_mode="Markdown")
+        await m.answer("Пришли подпись-описание пейзажа (или просто текст без фото) — сгенерю кадр.")
     elif "Ultra HDR" in m.text:
         WAIT[uid] = {"effect": "hdr"}
-        await m.answer("Пришли фото (можно с короткой подписью, например: «яркое HDR небо, сочная зелень»).")
+        await m.answer("Пришли фото. Можно приложить подпись — опишешь сцену, усилю её в стиле HDR.")
     elif "Clean Restore" in m.text:
         WAIT[uid] = {"effect": "clean"}
-        await m.answer("Пришли фото — аккуратно почищу шум/мыло и детализирую.")
+        await m.answer("Пришли фото. Уберу шум/мыло и аккуратно детализирую.")
 
 @dp.message_handler(content_types=["photo"])
 async def on_photo(m: types.Message):
@@ -169,47 +180,48 @@ async def on_photo(m: types.Message):
 
     effect = state.get("effect")
     caption = (m.caption or "").strip()
+
     await m.reply("⏳ Обрабатываю...")
-
     try:
-        # 1) конвертируем телеграм-файл -> стабильный replicate.delivery URL
-        rep_url = telegram_file_to_replicate_url(m.photo[-1].file_id)
+        # 1) Берём публичный URL телеграм‑файла (ASYNC!)
+        public_url = await telegram_file_to_public_url(m.photo[-1].file_id)
 
-        # 2) запускаем нужный пайплайн
+        # 2) Запускаем нужный пайплайн
         if effect == "nature":
-            out_url = run_nature_enhance(rep_url)
-        elif effect == "hdr":
-            out_url = run_ultra_hdr(hint_caption=caption)
-        elif effect == "clean":
-            out_url = run_clean_restore(rep_url)
+            out_url = run_nature_enhance(public_url)
         elif effect == "flux":
-            # Если человек всё-таки прислал фото, берём подпись как промпт.
             out_url = run_epic_landscape_flux(prompt_text=caption)
+        elif effect == "hdr":
+            out_url = run_ultra_hdr(public_url, hint_caption=caption)
+        elif effect == "clean":
+            out_url = run_clean_restore(public_url)
         else:
             raise RuntimeError("Unknown effect")
 
-        await m.reply_photo(out_url)
+        # 3) Отправляем результат НАДЁЖНО (скачали -> отдали как файл)
+        await send_image_by_url(m, out_url)
 
     except Exception:
-        tb = traceback.format_exc(limit=40)
+        tb = traceback.format_exc(limit=20)
+        # Показываем стек, чтобы оперативно понять причину
         await m.reply(f"🔥 Ошибка {effect}:\n```\n{tb}\n```", parse_mode="Markdown")
     finally:
         WAIT.pop(uid, None)
 
+# Текстовая генерация для Flux без фото
 @dp.message_handler(content_types=["text"])
 async def on_text(m: types.Message):
     uid = m.from_user.id
     state = WAIT.get(uid)
     if not state or state.get("effect") != "flux":
-        return  # реагируем только на Flux
-
-    prompt = (m.text or "").strip()
+        return
+    prompt = m.text.strip()
     await m.reply("⏳ Генерирую пейзаж по описанию...")
     try:
         out_url = run_epic_landscape_flux(prompt_text=prompt)
-        await m.reply_photo(out_url)
+        await send_image_by_url(m, out_url)
     except Exception:
-        tb = traceback.format_exc(limit=40)
+        tb = traceback.format_exc(limit=20)
         await m.reply(f"🔥 Ошибка flux:\n```\n{tb}\n```", parse_mode="Markdown")
     finally:
         WAIT.pop(uid, None)
