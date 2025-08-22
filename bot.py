@@ -1,7 +1,4 @@
 # bot.py — Nature Inspire (Replicate)
-# Требуются переменные окружения:
-#   TELEGRAM_API_TOKEN=xxxx:yyyy
-#   REPLICATE_API_TOKEN=r8_************
 
 import os
 import logging
@@ -19,26 +16,24 @@ if not API_TOKEN:
     raise RuntimeError("TELEGRAM_API_TOKEN")
 if not REPL_TOKEN:
     raise RuntimeError("REPLICATE_API_TOKEN")
-os.environ["REPLICATE_API_TOKEN"] = REPL_TOKEN  # для SDK
+os.environ["REPLICATE_API_TOKEN"] = REPL_TOKEN
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 # ----- MODELS -----
-MODEL_FLUX        = "black-forest-labs/flux-1.1-pro"  # текст→картинка
-MODEL_REFINER     = "fermatresearch/magic-image-refiner:507ddf6f977a7e30e46c0daefd30de7d563c72322f9e4cf7cbac52ef0f667b13"
-MODEL_ESRGAN      = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
-MODEL_SWINIR      = "jingyunliang/swinir:660d922d33153019e8c263a3bba265de882e7f4f70396546b6c9c8f9d47a021a"
+MODEL_FLUX    = "black-forest-labs/flux-1.1-pro"
+MODEL_REFINER = "fermatresearch/magic-image-refiner:507ddf6f977a7e30e46c0daefd30de7d563c72322f9e4cf7cbac52ef0f667b13"
+MODEL_ESRGAN  = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
+MODEL_SWINIR  = "jingyunliang/swinir:660d922d33153019e8c263a3bba265de882e7f4f70396546b6c9c8f9d47a021a"
 
 # ----- STATE -----
 WAIT = {}  # user_id -> {'effect': ...}
 
 def tg_file_url(file_path: str) -> str:
-    """Публичный URL фото из Telegram (Replicate принимает только URL)."""
     return f"https://api.telegram.org/file/bot{API_TOKEN}/{file_path}"
 
 def pick_url(output):
-    """Надёжно достаем URL из разных форматов ответа Replicate."""
     try:
         if isinstance(output, str):
             return output
@@ -57,69 +52,57 @@ def pick_url(output):
 
 def run_nature_enhance(public_url: str) -> str:
     """
-    🌿 Nature Enhance = Magic Image Refiner (улучшение) -> ESRGAN x2 (апскейл).
+    🌿 Magic Image Refiner (со strength) -> ESRGAN x2
     """
-    # шаг 1: рефайнер
-    ref_inputs = {
-        "image": public_url,
-        # можешь тюнить промпт; по умолчанию нейтрально улучшает
-        "prompt": "natural color balance, clean details, no artifacts, no extra objects"
-    }
-    ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
+    base_prompt = "natural color balance, clean details, no artifacts, no extra objects"
+    # 1) Пытаемся с strength
+    try:
+        ref_out = replicate.run(
+            MODEL_REFINER,
+            input={
+                "image": public_url,
+                "prompt": base_prompt,
+                "strength": 0.85  # если поле не поддерживается, поймаем 422 и откатимся
+            }
+        )
+    except Exception:
+        # 2) Фоллбек без strength (совместимость с другими сборками)
+        ref_out = replicate.run(
+            MODEL_REFINER,
+            input={"image": public_url, "prompt": base_prompt}
+        )
     ref_url = pick_url(ref_out)
 
-    # шаг 2: апскейл/детализация
-    esr_inputs = {"image": ref_url, "scale": 2}
-    esr_out = replicate.run(MODEL_ESRGAN, input=esr_inputs)
+    # 3) ESRGAN x2 — всегда
+    esr_out = replicate.run(MODEL_ESRGAN, input={"image": ref_url, "scale": 2})
     return pick_url(esr_out)
 
 def run_epic_landscape_flux(prompt_text: str) -> str:
-    """
-    🌄 Epic Landscape Flux = чистая генерация по тексту (без входного фото).
-    """
     if not prompt_text or not prompt_text.strip():
         prompt_text = (
             "epic panoramic landscape, dramatic sky, volumetric light, ultra-detailed mountains, "
             "lush forests, cinematic composition, award-winning nature photography"
         )
-    flux_inputs = {
-        "prompt": prompt_text,
-        "prompt_upsampling": True
-    }
-    flux_out = replicate.run(MODEL_FLUX, input=flux_inputs)
+    flux_out = replicate.run(MODEL_FLUX, input={"prompt": prompt_text, "prompt_upsampling": True})
     return pick_url(flux_out)
 
 def run_ultra_hdr(public_url: str, hint_caption: str = "") -> str:
     """
-    🏞 Ultra HDR = Flux 'image-inspired' через подсказку (caption как описание сцены) → ESRGAN x2.
-    (Flux здесь используется как мощный 'перерисовщик настроения' по тексту-описанию.)
+    🏞 FLUX (по тексту-наводке) -> ESRGAN x2
+    Если подпись пустая — автопромпт, чтобы не падало и не уходило в «пришли другую фотку».
     """
-    # На FLUX 1.1 pro нет прямого image2image, поэтому используем caption как направляющий промпт.
-    # Если caption пуст — подставим HDR-шаблон.
-    prompt_text = hint_caption.strip() if hint_caption else (
-        "HDR nature photo of the same scene, rich dynamic range, crisp details, deep shadows, "
-        "highlight recovery, realistic colors, professional nature photography"
-    )
-    # Генерация новая (не детермин. ремастер), зато качество + потом апскейл:
+    prompt_text = hint_caption.strip() if hint_caption else "Ultra HDR, realistic photo"
     flux_out = replicate.run(MODEL_FLUX, input={"prompt": prompt_text, "prompt_upsampling": True})
     flux_url = pick_url(flux_out)
-
     esr_out = replicate.run(MODEL_ESRGAN, input={"image": flux_url, "scale": 2})
     return pick_url(esr_out)
 
 def run_clean_restore(public_url: str) -> str:
-    """
-    📸 Clean Restore = SwinIR (убрать шум/жесть) → ESRGAN x2 (детализация).
-    """
-    # SwinIR ждёт параметры 'jpeg' и 'noise' как строки; оставим мягкие значения.
-    swin_inputs = {
-        "image": public_url,
-        "jpeg": "40",   # степень jpeg-деградации (модели так привычнее)
-        "noise": "15"   # уровень шума
-    }
-    swin_out = replicate.run(MODEL_SWINIR, input=swin_inputs)
+    swin_out = replicate.run(
+        MODEL_SWINIR,
+        input={"image": public_url, "jpeg": "40", "noise": "15"}
+    )
     swin_url = pick_url(swin_out)
-
     esr_out = replicate.run(MODEL_ESRGAN, input={"image": swin_url, "scale": 2})
     return pick_url(esr_out)
 
@@ -139,7 +122,7 @@ KB = ReplyKeyboardMarkup(
 async def on_start(m: types.Message):
     await m.answer(
         "Привет ✨ Природные кадры улучшим на максимум.\n"
-        "Выбери режим ниже, затем пришли фото (для Flux-генерации можно прислать только текст в подписи).",
+        "Выбери режим ниже. Для Flux можно прислать только текст (промпт).",
         reply_markup=KB
     )
 
@@ -151,10 +134,10 @@ async def on_choose(m: types.Message):
         await m.answer("Ок! Пришли фото. ⛰️🌿")
     elif "Epic Landscape Flux" in m.text:
         WAIT[uid] = {"effect": "flux"}
-        await m.answer("Пришли фото (по желанию) с подписью-описанием сцены — возьму подпись как промпт. Если подпись пустая, сгенерю эпик-ландшафт по умолчанию.")
+        await m.answer("Пришли описание сцены (можно без фото) — сгенерю эпик‑ландшафт.")
     elif "Ultra HDR" in m.text:
         WAIT[uid] = {"effect": "hdr"}
-        await m.answer("Пришли фото. Можно приложить подпись — опишешь сцену, усилю её в стиле HDR.")
+        await m.answer("Пришли фото. Можно приложить подпись — усилю сцену в стиле HDR.")
     elif "Clean Restore" in m.text:
         WAIT[uid] = {"effect": "clean"}
         await m.answer("Пришли фото. Уберу шум/мыло и аккуратно детализирую.")
@@ -170,7 +153,6 @@ async def on_photo(m: types.Message):
     effect = state.get("effect")
     caption = (m.caption or "").strip()
 
-    # Получаем Telegram-file URL
     await m.reply("⏳ Обрабатываю...")
     try:
         tg_file = await bot.get_file(m.photo[-1].file_id)
@@ -179,7 +161,6 @@ async def on_photo(m: types.Message):
         if effect == "nature":
             out_url = run_nature_enhance(public_url)
         elif effect == "flux":
-            # Для Flux берём caption как промпт. Фото не используем напрямую.
             out_url = run_epic_landscape_flux(prompt_text=caption)
         elif effect == "hdr":
             out_url = run_ultra_hdr(public_url, hint_caption=caption)
@@ -191,19 +172,16 @@ async def on_photo(m: types.Message):
         await m.reply_photo(out_url)
 
     except Exception:
-        # Без техподробностей
         await m.reply("Не удалось обработать фото. Попробуй другую фотографию или другую подпись.")
     finally:
         WAIT.pop(uid, None)
 
-# Также разрешим чисто текст для Flux (пользователь может прислать prompt без фото)
 @dp.message_handler(content_types=["text"])
 async def on_text(m: types.Message):
     uid = m.from_user.id
     state = WAIT.get(uid)
     if not state or state.get("effect") != "flux":
-        return  # реагируем только когда выбран Flux
-
+        return
     prompt = m.text.strip()
     await m.reply("⏳ Генерирую пейзаж по описанию...")
     try:
