@@ -4,7 +4,6 @@ import os
 import logging
 import replicate
 import traceback
-from replicate.files import upload as repl_upload
 import tempfile, urllib.request, os as _os
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
