@@ -89,7 +89,7 @@ def run_nature_enhance(public_url: str) -> str:
     ref_inputs = {
         "image": public_url,
         "prompt": "Ultra HDR natural but deep color balance, clean details, no artifacts, no extra objects"
-        "strenght": "0.65"
+        "strength": 0.65
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     ref_url = pick_url(ref_out)
