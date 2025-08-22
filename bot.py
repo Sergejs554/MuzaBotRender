@@ -51,23 +51,7 @@ def pick_url(output):
         return str(output)
     except Exception:
         return str(output)
-async def telegram_file_to_replicate_url(file_id: str) -> str:
-    """Скачиваем фото из TG во временный файл и заливаем в Replicate; возвращаем https‑URL."""
-    tg_file = await bot.get_file(file_id)
-    src_url = tg_file_url(tg_file.file_path)
 
-    fd, tmp_path = tempfile.mkstemp()
-    _os.close(fd)
-    try:
-        urllib.request.urlretrieve(src_url, tmp_path)
-        tg_file = await bot.get_file(m.photo[-1].file_id)
-        rep_url = tg_file_url(tg_file.file_path)
-        return uploaded_url
-    finally:
-        try:
-            _os.remove(tmp_path)
-        except Exception:
-            pass
 # ===================== PIPELINES =====================
 
 def run_nature_enhance(replicate_url: str) -> str:
