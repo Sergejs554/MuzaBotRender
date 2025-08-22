@@ -3,6 +3,9 @@
 import os
 import logging
 import replicate
+import traceback
+from replicate.files import upload as repl_upload
+import tempfile, urllib.request, os as _os
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils import executor
@@ -47,33 +50,36 @@ def pick_url(output):
         return str(output)
     except Exception:
         return str(output)
+async def telegram_file_to_replicate_url(file_id: str) -> str:
+    """Скачиваем фото из TG во временный файл и заливаем в Replicate; возвращаем https‑URL."""
+    tg_file = await bot.get_file(file_id)
+    src_url = tg_file_url(tg_file.file_path)
 
+    fd, tmp_path = tempfile.mkstemp()
+    _os.close(fd)
+    try:
+        urllib.request.urlretrieve(src_url, tmp_path)
+        uploaded_url = repl_upload(tmp_path)  # -> строка https://replicate.delivery/...
+        return uploaded_url
+    finally:
+        try:
+            _os.remove(tmp_path)
+        except Exception:
+            pass
 # ===================== PIPELINES =====================
 
-def run_nature_enhance(public_url: str) -> str:
+def run_nature_enhance(replicate_url: str) -> str:
     """
-    🌿 Magic Image Refiner (со strength) -> ESRGAN x2
+    🌿 Nature Enhance = Magic Image Refiner -> ESRGAN x2.
+    На вход подаём НЕ телеграм-ссылку, а уже загруженный в Replicate URL.
     """
-    base_prompt = "natural color balance, clean details, no artifacts, no extra objects"
-    # 1) Пытаемся с strength
-    try:
-        ref_out = replicate.run(
-            MODEL_REFINER,
-            input={
-                "image": public_url,
-                "prompt": base_prompt,
-                "strength": 0.85  # если поле не поддерживается, поймаем 422 и откатимся
-            }
-        )
-    except Exception:
-        # 2) Фоллбек без strength (совместимость с другими сборками)
-        ref_out = replicate.run(
-            MODEL_REFINER,
-            input={"image": public_url, "prompt": base_prompt}
-        )
+    ref_inputs = {
+        "image": replicate_url,
+        "prompt": "natural color balance, clean details, no artifacts, no extra objects"
+    }
+    ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     ref_url = pick_url(ref_out)
 
-    # 3) ESRGAN x2 — всегда
     esr_out = replicate.run(MODEL_ESRGAN, input={"image": ref_url, "scale": 2})
     return pick_url(esr_out)
 
@@ -152,27 +158,43 @@ async def on_photo(m: types.Message):
 
     effect = state.get("effect")
     caption = (m.caption or "").strip()
-
     await m.reply("⏳ Обрабатываю...")
-    try:
-        tg_file = await bot.get_file(m.photo[-1].file_id)
-        public_url = tg_file_url(tg_file.file_path)
 
+    try:
         if effect == "nature":
-            out_url = run_nature_enhance(public_url)
+            # 1) Заливаем файл в Replicate (надёжно)
+            rep_url = await telegram_file_to_replicate_url(m.photo[-1].file_id)
+            # 2) Гоним пайплайн
+            out_url = run_nature_enhance(rep_url)
+            await m.reply_photo(out_url)
+
         elif effect == "flux":
             out_url = run_epic_landscape_flux(prompt_text=caption)
+            await m.reply_photo(out_url)
+
         elif effect == "hdr":
+            # как было
+            tg_file = await bot.get_file(m.photo[-1].file_id)
+            public_url = tg_file_url(tg_file.file_path)
             out_url = run_ultra_hdr(public_url, hint_caption=caption)
+            await m.reply_photo(out_url)
+
         elif effect == "clean":
+            tg_file = await bot.get_file(m.photo[-1].file_id)
+            public_url = tg_file_url(tg_file.file_path)
             out_url = run_clean_restore(public_url)
+            await m.reply_photo(out_url)
+
         else:
-            raise RuntimeError("Unknown effect")
+            await m.reply("Неизвестный режим.")
+            return
 
-        await m.reply_photo(out_url)
-
-    except Exception:
-        await m.reply("Не удалось обработать фото. Попробуй другую фотографию или другую подпись.")
+    except Exception as e:
+        # Показываем ПОЛНУЮ причину, чтобы её поймать (только на время отладки)
+        tb = traceback.format_exc()
+        msg = f"🔥 Ошибка Nature Enhance:\n{e}\n\n{tb}"
+        # Telegram ограничивает длину — на всякий случай подрежем
+        await m.reply(msg[-3900:])
     finally:
         WAIT.pop(uid, None)
 
