@@ -1,6 +1,6 @@
 # Telegram
 aiogram==2.25.1
-
+replicate==0.25.2
 # Imaging / CV
 numpy<2.0
 opencv-python-headless>=4.8.0.74
