@@ -3,6 +3,8 @@
 import os
 import logging
 import replicate
+import aiohttp
+import tempfile
 import traceback
 import tempfile, urllib.request, os as _os
 from aiogram import Bot, Dispatcher, types
@@ -148,7 +150,8 @@ async def on_choose(m: types.Message):
         WAIT[uid] = {"effect": "clean"}
         await m.answer("Пришли фото. Уберу шум/мыло и аккуратно детализирую.")
 
-@dp.message_handler(content_types=["photo"])
+
+    @dp.message_handler(content_types=["photo"])
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     state = WAIT.get(uid)
@@ -161,9 +164,8 @@ async def on_photo(m: types.Message):
 
     await m.reply("⏳ Обрабатываю...")
     try:
-        # 🔑 Вот тут получаем прямой URL на фото из Telegram
-        tg_file = await bot.get_file(m.photo[-1].file_id)
-        rep_url = tg_file_url(tg_file.file_path)
+        # 👉 получаем пригодный для моделей URL через Replicate Storage
+        rep_url = await telegram_file_to_replicate_url(bot, m.photo[-1].file_id)
 
         if effect == "nature":
             out_url = run_nature_enhance(rep_url)
@@ -178,32 +180,9 @@ async def on_photo(m: types.Message):
 
         await m.reply_photo(out_url)
 
-    except Exception as e:
-        await m.reply(f"🔥 Ошибка {effect}: {e}")
-    finally:
-        WAIT.pop(uid, None)
-    except Exception as e:
-        # Показываем ПОЛНУЮ причину, чтобы её поймать (только на время отладки)
-        tb = traceback.format_exc()
-        msg = f"🔥 Ошибка Nature Enhance:\n{e}\n\n{tb}"
-        # Telegram ограничивает длину — на всякий случай подрежем
-        await m.reply(msg[-3900:])
-    finally:
-        WAIT.pop(uid, None)
-
-@dp.message_handler(content_types=["text"])
-async def on_text(m: types.Message):
-    uid = m.from_user.id
-    state = WAIT.get(uid)
-    if not state or state.get("effect") != "flux":
-        return
-    prompt = m.text.strip()
-    await m.reply("⏳ Генерирую пейзаж по описанию...")
-    try:
-        out_url = run_epic_landscape_flux(prompt_text=prompt)
-        await m.reply_photo(out_url)
     except Exception:
-        await m.reply("Не удалось сгенерировать по этому описанию. Попробуй переформулировать.")
+        tb = traceback.format_exc(limit=20)
+        await m.reply(f"🔥 Ошибка {effect}:\n```\n{tb}\n```", parse_mode="Markdown")
     finally:
         WAIT.pop(uid, None)
 
