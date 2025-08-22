@@ -58,7 +58,8 @@ async def telegram_file_to_replicate_url(file_id: str) -> str:
     _os.close(fd)
     try:
         urllib.request.urlretrieve(src_url, tmp_path)
-        uploaded_url = repl_upload(tmp_path)  # -> строка https://replicate.delivery/...
+        tg_file = await bot.get_file(m.photo[-1].file_id)
+        rep_url = tg_file_url(tg_file.file_path)
         return uploaded_url
     finally:
         try:
