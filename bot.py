@@ -158,37 +158,30 @@ async def on_photo(m: types.Message):
 
     effect = state.get("effect")
     caption = (m.caption or "").strip()
+
     await m.reply("⏳ Обрабатываю...")
-
     try:
-        if effect == "nature":
-            # 1) Заливаем файл в Replicate (надёжно)
-            rep_url = await telegram_file_to_replicate_url(m.photo[-1].file_id)
-            # 2) Гоним пайплайн
-            out_url = run_nature_enhance(rep_url)
-            await m.reply_photo(out_url)
+        # 🔑 Вот тут получаем прямой URL на фото из Telegram
+        tg_file = await bot.get_file(m.photo[-1].file_id)
+        rep_url = tg_file_url(tg_file.file_path)
 
+        if effect == "nature":
+            out_url = run_nature_enhance(rep_url)
         elif effect == "flux":
             out_url = run_epic_landscape_flux(prompt_text=caption)
-            await m.reply_photo(out_url)
-
         elif effect == "hdr":
-            # как было
-            tg_file = await bot.get_file(m.photo[-1].file_id)
-            public_url = tg_file_url(tg_file.file_path)
-            out_url = run_ultra_hdr(public_url, hint_caption=caption)
-            await m.reply_photo(out_url)
-
+            out_url = run_ultra_hdr(rep_url, hint_caption=caption)
         elif effect == "clean":
-            tg_file = await bot.get_file(m.photo[-1].file_id)
-            public_url = tg_file_url(tg_file.file_path)
-            out_url = run_clean_restore(public_url)
-            await m.reply_photo(out_url)
-
+            out_url = run_clean_restore(rep_url)
         else:
-            await m.reply("Неизвестный режим.")
-            return
+            raise RuntimeError("Unknown effect")
 
+        await m.reply_photo(out_url)
+
+    except Exception as e:
+        await m.reply(f"🔥 Ошибка {effect}: {e}")
+    finally:
+        WAIT.pop(uid, None)
     except Exception as e:
         # Показываем ПОЛНУЮ причину, чтобы её поймать (только на время отладки)
         tb = traceback.format_exc()
