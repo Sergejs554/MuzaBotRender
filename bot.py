@@ -16,9 +16,9 @@ logging.basicConfig(level=logging.INFO)
 API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
 REPL_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 if not API_TOKEN:
-    raise RuntimeError("TELEGRAM_API_TOKEN не задан")
+    raise RuntimeError("TELEGRAM_API_TOKEN")
 if not REPL_TOKEN:
-    raise RuntimeError("REPLICATE_API_TOKEN не задан")
+    raise RuntimeError("REPLICATE_API_TOKEN")
 os.environ["REPLICATE_API_TOKEN"] = REPL_TOKEN  # для SDK
 
 bot = Bot(token=API_TOKEN)
