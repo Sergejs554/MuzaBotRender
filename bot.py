@@ -88,12 +88,12 @@ def run_nature_enhance(public_url: str) -> str:
     """
     ref_inputs = {
         "image": public_url,
-        "prompt": "ULTRA HDR with pose-strenght 0.6 deep but natural color balance, clean details, no artifacts, no extra objects"
+        "prompt": "ULTRA HDR with strenght 0.6 deep colours, clean details, amazing enchance"
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     ref_url = pick_url(ref_out)
 
-    esr_out = replicate.run(MODEL_ESRGAN, input={"image": ref_url, "scale": 2})
+    esr_out = replicate.run(MODEL_ESRGAN, input={"image": ref_url, "stranght": 0.65". "scale": 2})
     return pick_url(esr_out)
 
 def run_epic_landscape_flux(prompt_text: str) -> str:
