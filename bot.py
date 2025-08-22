@@ -88,7 +88,7 @@ def run_nature_enhance(public_url: str) -> str:
     """
     ref_inputs = {
         "image": public_url,
-        "prompt": "Ultra HDR natural reference stranght 0.65 but deep color balance, clean details, no artifacts, no extra objects"    
+        "prompt": "ULTRA HDR with pose-strenght 0.6 deep but natural color balance, clean details, no artifacts, no extra objects"
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     ref_url = pick_url(ref_out)
@@ -171,17 +171,12 @@ async def on_choose(m: types.Message):
         await m.answer("Пришли фото. Уберу шум/мыло и аккуратно детализирую.")
 
 @dp.message_handler(content_types=["photo"])
-async def download_tg_photo_to_tmp(file_id: str) -> str:
-    file = await bot.get_file(file_id)
-    url = f"https://api.telegram.org/file/bot{API_TOKEN}/{file.file_path}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            data = await resp.read()
-    tmp_path = tempfile.mkstemp(suffix=".jpg")[1]
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-    return tmp_path
+async def on_photo(m: types.Message):
+    uid = m.from_user.id
+    state = WAIT.get(uid)
+    if not state:
+        await m.reply("Выбери режим на клавиатуре ниже и затем пришли фото.", reply_markup=KB)
+        return
 
     effect = state.get("effect")
     caption = (m.caption or "").strip()
@@ -205,7 +200,8 @@ async def download_tg_photo_to_tmp(file_id: str) -> str:
 
         # 3) Отправляем результат НАДЁЖНО (скачали -> отдали как файл)
         await send_image_by_url(m, out_url)
-    except Exception as e:
+
+    except Exception:
         tb = traceback.format_exc(limit=20)
         # Показываем стек, чтобы оперативно понять причину
         await m.reply(f"🔥 Ошибка {effect}:\n```\n{tb}\n```", parse_mode="Markdown")
