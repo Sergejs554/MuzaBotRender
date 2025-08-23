@@ -1,9 +1,8 @@
-# bot.py — Nature Inspire (Replicate) — FIXED loop + safe send
+# bot.py — Nature Inspire (Replicate) — HDR-усиленный Nature Enhance
 
 import os
 import logging
 import replicate
-import asyncio
 import traceback
 import urllib.request
 import tempfile
@@ -32,16 +31,19 @@ MODEL_REFINER = "fermatresearch/magic-image-refiner:507ddf6f977a7e30e46c0daefd30
 MODEL_ESRGAN  = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
 MODEL_SWINIR  = "jingyunliang/swinir:660d922d33153019e8c263a3bba265de882e7f4f70396546b6c9c8f9d47a021a"
 
+# Тонкая настройка силы улучшения (можно крутить без кода через переменную окружения)
+NATURE_STRENGTH = float(os.getenv("NATURE_STRENGTH", "0.7"))  # 0.5..0.8 обычно оптимально
+
 # ---------- STATE ----------
 WAIT = {}  # user_id -> {'effect': 'nature'|'flux'|'hdr'|'clean'}
 
 # ---------- HELPERS ----------
 def tg_public_url(file_path: str) -> str:
-    """Публичная ссылка Telegram‑файла (подходит для Replicate как input)."""
+    """Публичная ссылка Telegram‑файла для Replicate."""
     return f"https://api.telegram.org/file/bot{API_TOKEN}/{file_path}"
 
 async def telegram_file_to_public_url(file_id: str) -> str:
-    """ASYNC! Берём путь к файлу и превращаем в публичный URL для Replicate."""
+    """ASYNC: получаем публичный URL фото из Telegram."""
     tg_file = await bot.get_file(file_id)
     return tg_public_url(tg_file.file_path)
 
@@ -69,9 +71,7 @@ def download_to_temp(url: str) -> str:
     return path
 
 async def send_image_by_url(m: types.Message, url: str):
-    """
-    Чтобы не ловить 'Failed to get http url content', скачиваем и шлём как файл.
-    """
+    """Чтоб не ловить 'Failed to get http url content' — шлём как файл из tmp."""
     path = None
     try:
         path = download_to_temp(url)
@@ -84,22 +84,28 @@ async def send_image_by_url(m: types.Message, url: str):
 
 def run_nature_enhance(public_url: str) -> str:
     """
-    🌿 Nature Enhance = Magic Image Refiner -> ESRGAN x2
+    🌿 Nature Enhance = Magic Image Refiner (HDR-профиль) -> ESRGAN x2
+    Даёт «вау»-контраст, глубокие цвета и расширенный динамический диапазон без потери реализма.
     """
     ref_inputs = {
         "image": public_url,
-        "prompt": "ULTRA HDR with strenght 0.6 deep colours, clean details, amazing enchance"
+        # Сильный, но реалистичный профиль
+        "prompt": (
+            "Ultra HDR photo, dramatic sky, deep contrast, vibrant yet natural colors, "
+            "cinematic lighting, realistic fine details, clean foliage and clouds, no artifacts"
+        ),
+        # многие билды поддерживают параметр strength (0..1). Если игнорируется — просто нейтрально.
+        "strength": NATURE_STRENGTH
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     ref_url = pick_url(ref_out)
 
+    # Детализация/апскейл
     esr_out = replicate.run(MODEL_ESRGAN, input={"image": ref_url, "scale": 2})
     return pick_url(esr_out)
 
 def run_epic_landscape_flux(prompt_text: str) -> str:
-    """
-    🌄 Epic Landscape Flux = чистая генерация по тексту.
-    """
+    """🌄 Epic Landscape Flux = чистая генерация по тексту."""
     if not prompt_text or not prompt_text.strip():
         prompt_text = (
             "epic panoramic landscape, dramatic sky, volumetric light, ultra-detailed mountains, "
@@ -110,9 +116,8 @@ def run_epic_landscape_flux(prompt_text: str) -> str:
 
 def run_ultra_hdr(_public_url_ignored: str, hint_caption: str = "") -> str:
     """
-    🏞 Ultra HDR = Flux по HDR-шаблону (capion как подсказка) -> ESRGAN x2.
-    (FLUX 1.1 Pro не принимает image2image, поэтому фото тут выступает как контекст,
-     а преобразование делаем текстом, затем апскейлим.)
+    🏞 Ultra HDR = Flux по HDR-шаблону (caption как подсказка) -> ESRGAN x2.
+    (FLUX 1.1 Pro не имеет image2image — используем текст как направляющую.)
     """
     prompt_text = hint_caption.strip() if hint_caption else (
         "Ultra HDR nature photo of the same scene, rich dynamic range, crisp details, "
@@ -125,9 +130,7 @@ def run_ultra_hdr(_public_url_ignored: str, hint_caption: str = "") -> str:
     return pick_url(esr_out)
 
 def run_clean_restore(public_url: str) -> str:
-    """
-    📸 Clean Restore = SwinIR (шум/мыло) -> ESRGAN x2.
-    """
+    """📸 Clean Restore = SwinIR (шум/мыло) -> ESRGAN x2."""
     swin_out = replicate.run(MODEL_SWINIR, input={"image": public_url, "jpeg": "40", "noise": "15"})
     swin_url = pick_url(swin_out)
 
@@ -150,7 +153,7 @@ KB = ReplyKeyboardMarkup(
 async def on_start(m: types.Message):
     await m.answer(
         "Привет ✨ Природные кадры улучшим на максимум.\n"
-        "Выбери режим ниже, затем пришли фото (для Flux-генерации можно прислать только текст в подписи).",
+        "Выбери режим ниже, затем пришли фото (для Flux‑генерации можно прислать только текст в подписи).",
         reply_markup=KB
     )
 
@@ -162,7 +165,7 @@ async def on_choose(m: types.Message):
         await m.answer("Ок! Пришли фото. ⛰️🌿")
     elif "Epic Landscape Flux" in m.text:
         WAIT[uid] = {"effect": "flux"}
-        await m.answer("Пришли подпись-описание пейзажа (или просто текст без фото) — сгенерю кадр.")
+        await m.answer("Пришли подпись‑описание пейзажа (или просто текст без фото) — сгенерю кадр.")
     elif "Ultra HDR" in m.text:
         WAIT[uid] = {"effect": "hdr"}
         await m.answer("Пришли фото. Можно приложить подпись — опишешь сцену, усилю её в стиле HDR.")
@@ -183,10 +186,8 @@ async def on_photo(m: types.Message):
 
     await m.reply("⏳ Обрабатываю...")
     try:
-        # 1) Берём публичный URL телеграм‑файла (ASYNC!)
         public_url = await telegram_file_to_public_url(m.photo[-1].file_id)
 
-        # 2) Запускаем нужный пайплайн
         if effect == "nature":
             out_url = run_nature_enhance(public_url)
         elif effect == "flux":
@@ -198,17 +199,14 @@ async def on_photo(m: types.Message):
         else:
             raise RuntimeError("Unknown effect")
 
-        # 3) Отправляем результат НАДЁЖНО (скачали -> отдали как файл)
         await send_image_by_url(m, out_url)
 
     except Exception:
         tb = traceback.format_exc(limit=20)
-        # Показываем стек, чтобы оперативно понять причину
         await m.reply(f"🔥 Ошибка {effect}:\n```\n{tb}\n```", parse_mode="Markdown")
     finally:
         WAIT.pop(uid, None)
 
-# Текстовая генерация для Flux без фото
 @dp.message_handler(content_types=["text"])
 async def on_text(m: types.Message):
     uid = m.from_user.id
