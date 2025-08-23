@@ -120,7 +120,7 @@ async def download_and_resize_input(file_id: str, max_side: int = 1536) -> str:
 def run_nature_enhance_refiner_only(local_path: str) -> str:
     ref_inputs = {
         "image": open(local_path, "rb"),
-        "prompt": "super clarity, HDR depth, vivid natural colors, dramatic light, fine details preserved"
+        "prompt": "super clarity, HDR depth, vivid natural colors, dramatic light, fine details preserved",
         "strength": 0.65
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
