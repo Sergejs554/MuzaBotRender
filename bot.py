@@ -120,7 +120,7 @@ async def download_and_resize_input(file_id: str, max_side: int = 1536) -> str:
 def run_nature_enhance_refiner_only(local_path: str) -> str:
     ref_inputs = {
         "image": open(local_path, "rb"),
-        "prompt": "subtle clarity, realistic color balance, preserve fine textures, no extra objects, no oversharpen"
+        "prompt": "super clarity, ultra-detailed textures, dramatic natural colors, vivid skies, deep contrast, enhanced HDR lighting, realistic sharpness, rich depth, vibrant foliage, crystal clear water, cinematic atmosphere, professional nature photography, no artifacts, no blur, preserve natural look"
     }
     ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
     return pick_url(ref_out)
