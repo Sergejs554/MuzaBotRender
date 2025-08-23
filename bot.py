@@ -81,28 +81,48 @@ async def send_image_by_url(m: types.Message, url: str):
             os.remove(path)
 
 # ===================== PIPELINES =====================
+# ======= ПОДМЕНА ТОЛЬКО ЭТОЙ ФУНКЦИИ =======
 
 def run_nature_enhance(public_url: str) -> str:
     """
-    🌿 Nature Enhance = Magic Image Refiner (HDR-профиль) -> ESRGAN x2
-    Даёт «вау»-контраст, глубокие цвета и расширенный динамический диапазон без потери реализма.
+    🌿 Nature Enhance (v2):
+    1) Refiner #1 — мягкая, естественная «очистка» и баланс.
+    2) Refiner #2 — акцентная версия: HDR‑контраст, насыщенность, подчистка текстур.
+    3) ESRGAN x4 (fallback на x2 при 422) — вытягиваем микродетали, затем аккуратно уменьшаем до исходной ширины.
     """
-    ref_inputs = {
-        "image": public_url,
-        # Сильный, но реалистичный профиль
-        "prompt": (
-            "Ultra HDR photo, dramatic sky, deep contrast, vibrant yet natural colors, "
-            "cinematic lighting, realistic fine details, clean foliage and clouds, no artifacts"
-        ),
-        # многие билды поддерживают параметр strength (0..1). Если игнорируется — просто нейтрально.
-        "strength": NATURE_STRENGTH
-    }
-    ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
-    ref_url = pick_url(ref_out)
+    # Pass 1 — нейтральный баланс и «чистка»
+    ref1 = replicate.run(
+        MODEL_REFINER,
+        input={
+            "image": public_url,
+            "prompt": (
+                "natural color balance, clean realistic details, haze removal, gentle contrast, "
+                "no artifacts, no extra objects, photo realism"
+            )
+        }
+    )
+    url1 = pick_url(ref1)
 
-    # Детализация/апскейл
-    esr_out = replicate.run(MODEL_ESRGAN, input={"image": ref_url, "scale": 2})
-    return pick_url(esr_out)
+    # Pass 2 — «панч»: HDR/цвет/объём, но без артефактов
+    ref2 = replicate.run(
+        MODEL_REFINER,
+        input={
+            "image": url1,
+            "prompt": (
+                "ULTRA HDR look with wide dynamic range and deep yet realistic colors, crisp clouds, "
+                "micro-contrast in foliage and textures, clear shadows and preserved highlights, "
+                "film-like richness, no halos, no oversharpening, no neon colors"
+            )
+        }
+    )
+    url2 = pick_url(ref2)
+
+    # Апскейл: стараемся x4, если вылет по памяти — откатываемся на x2
+    try:
+        esr = replicate.run(MODEL_ESRGAN, input={"image": url2, "scale": 4})
+    except Exception:
+        esr = replicate.run(MODEL_ESRGAN, input={"image": url2, "scale": 2})
+    return pick_url(esr)
 
 def run_epic_landscape_flux(prompt_text: str) -> str:
     """🌄 Epic Landscape Flux = чистая генерация по тексту."""
