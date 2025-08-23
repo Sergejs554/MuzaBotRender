@@ -1,5 +1,6 @@
-# bot.py — Nature Inspire (Replicate) — Refiner + Swin2SR x4 (флагман)
+# bot.py — Nature Inspire (Replicate) — SOLO Clarity-Upscaler (flagship)
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
+# pip: aiogram==2.25.1 pillow replicate
 
 import os
 import logging
@@ -28,9 +29,8 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 # ---------- MODELS ----------
-MODEL_FLUX    = "black-forest-labs/flux-1.1-pro"
-MODEL_REFINER = "fermatresearch/magic-image-refiner:507ddf6f977a7e30e46c0daefd30de7d563c72322f9e4cf7cbac52ef0f667b13"
-MODEL_SWIN2SR = "mv-lab/swin2sr:a01b0512004918ca55d02e554914a9eca63909fa83a29ff0f115c78a7045574f"  # x4 SR
+MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
+MODEL_FLUX    = "black-forest-labs/flux-1.1-pro"  # оставляем как было
 MODEL_SWINIR  = "jingyunliang/swinir:660d922d33153019e8c263a3bba265de882e7f4f70396546b6c9c8f9d47a021a"
 
 # ---------- STATE ----------
@@ -51,13 +51,9 @@ def pick_url(output) -> str:
         if isinstance(output, (list, tuple)) and output:
             o0 = output[0]
             url_attr = getattr(o0, "url", None)
-            if callable(url_attr): return str(url_attr())
-            if url_attr: return str(url_attr)
-            return str(o0)
+            return str(url_attr() if callable(url_attr) else (url_attr or o0))
         url_attr = getattr(output, "url", None)
-        if callable(url_attr): return str(url_attr())
-        if url_attr: return str(url_attr)
-        return str(output)
+        return str(url_attr() if callable(url_attr) else (url_attr or output))
     except Exception:
         return str(output)
 
@@ -68,6 +64,7 @@ def download_to_temp(url: str) -> str:
     return path
 
 def ensure_photo_size_under_telegram_limit(path: str, max_bytes: int = 10 * 1024 * 1024) -> str:
+    """Если файл >10MB — пережимаем JPEG до лимита."""
     try:
         if os.path.getsize(path) <= max_bytes:
             return path
@@ -78,19 +75,22 @@ def ensure_photo_size_under_telegram_limit(path: str, max_bytes: int = 10 * 1024
             os.close(tmp_fd)
             img.save(tmp_path, "JPEG", quality=q, optimize=True)
             if os.path.getsize(tmp_path) <= max_bytes:
-                os.remove(path)
+                try: os.remove(path)
+                except: pass
                 return tmp_path
             os.remove(tmp_path)
             q -= 8
         final_fd, final_path = tempfile.mkstemp(suffix=".jpg")
         os.close(final_fd)
         img.save(final_path, "JPEG", quality=max(q, 40), optimize=True)
-        os.remove(path)
+        try: os.remove(path)
+        except: pass
         return final_path
     except Exception:
         return path
 
 async def send_image_by_url(m: types.Message, url: str):
+    """Качаем результат и шлём как файл (обход ‘Failed to get http url content’) + соблюдаем 10MB."""
     path = None
     try:
         path = download_to_temp(url)
@@ -98,9 +98,14 @@ async def send_image_by_url(m: types.Message, url: str):
         await m.reply_photo(InputFile(path))
     finally:
         if path and os.path.exists(path):
-            os.remove(path)
+            try: os.remove(path)
+            except: pass
 
-async def download_and_resize_input(file_id: str, max_side: int = 1536) -> str:
+async def download_and_resize_input(file_id: str, max_side: int = 2048) -> str:
+    """
+    Скачиваем из TG и мягко уменьшаем до безопасного размера по длинной стороне
+    (чтобы стабильно проходило на модели и держать разумный вес).
+    """
     public_url = await telegram_file_to_public_url(file_id)
     fd, path = tempfile.mkstemp(suffix=".jpg")
     os.close(fd)
@@ -117,35 +122,64 @@ async def download_and_resize_input(file_id: str, max_side: int = 1536) -> str:
     return path
 
 # ===================== PIPELINES =====================
-def run_nature_enhance_refiner_only(local_path: str) -> str:
-    ref_inputs = {
-        "image": open(local_path, "rb"),
-        "prompt": "super clarity, HDR depth, vivid natural colors, dramatic light, fine details preserved",
-        "strength": 0.65
-    }
-    ref_out = replicate.run(MODEL_REFINER, input=ref_inputs)
-    return pick_url(ref_out)
 
-def run_swin2sr_x4(public_url: str) -> str:
-    sr_out = replicate.run(MODEL_SWIN2SR, input={"image": public_url})
-    return pick_url(sr_out)
-
-async def run_nature_enhance_pipeline(file_id: str) -> str:
-    tmp_path = await download_and_resize_input(file_id, 1536)
+async def run_nature_clarity(file_id: str) -> str:
+    """
+    SOLO Clarity-Upscaler: акцент на микродеталях + цвет, без мыла и без «пластика».
+    Схема: TG → безопасный ресайз → clarity-upscaler (x4).
+    """
+    tmp_path = await download_and_resize_input(file_id, max_side=2048)
     try:
-        ref_url = run_nature_enhance_refiner_only(tmp_path)
-        sr_url  = run_swin2sr_x4(ref_url)
-        return sr_url
+        # Фокусный промпт — короткий и точный (микродеталь + реализм + HDR баланс)
+        prompt = (
+            "ultra-realistic clarity, preserve micro-textures (leaves, water ripples, clouds), "
+            "deep but natural colors, balanced HDR, no halos, no plastic smoothing, no oversharpen"
+        )
+        negative_prompt = (
+            "low quality, blurry, watercolor, smudged, noise, artifact, oversaturated, "
+            "cartoonish, fake details, halos, plastic skin"
+        )
+
+        with open(tmp_path, "rb") as f:
+            out = replicate.run(
+                MODEL_CLARITY,
+                input={
+                    "image": f,                 # подаём как файл — надёжнее чем внешняя ссылка
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "scale_factor": 4,          # x4 upscale
+                    "dynamic": 8,               # HDR/тональный драйв (6 по умолчанию; 8 — чуть мощнее)
+                    "creativity": 0.25,         # меньше «фантазии», больше сохранения оригинала
+                    "resemblance": 0.65,        # держим идентичность сцены
+                    "scheduler": "DPM++ 3M SDE Karras",
+                    "num_inference_steps": 22   # чуть выше дефолта для стабильных деталей
+                    # seed опускаем, пусть будет рандом (меньше повторов)
+                }
+            )
+        return pick_url(out)
     finally:
         try: os.remove(tmp_path)
         except: pass
 
+def run_epic_landscape_flux(prompt_text: str) -> str:
+    if not prompt_text or not prompt_text.strip():
+        prompt_text = (
+            "epic panoramic landscape, dramatic sky, volumetric light, ultra-detailed mountains, "
+            "lush forests, cinematic composition, award-winning nature photography"
+        )
+    out = replicate.run(MODEL_FLUX, input={"prompt": prompt_text, "prompt_upsampling": True})
+    return pick_url(out)
+
+def run_clean_restore(public_url: str) -> str:
+    swin_out = replicate.run(MODEL_SWINIR, input={"image": public_url, "jpeg": "40", "noise": "15"})
+    return pick_url(swin_out)
+
 # ===================== UI / HANDLERS =====================
+
 KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("🌿 Nature Enhance")],
         [KeyboardButton("🌄 Epic Landscape Flux")],
-        [KeyboardButton("🏞 Ultra HDR")],
         [KeyboardButton("📸 Clean Restore")],
     ],
     resize_keyboard=True
@@ -154,12 +188,12 @@ KB = ReplyKeyboardMarkup(
 @dp.message_handler(commands=["start"])
 async def on_start(m: types.Message):
     await m.answer(
-        "Привет ✨ Природу усилим по флагманской схеме (Refiner + Swin2SR x4).\n"
-        "Выбери режим ниже и пришли фото.",
+        "Привет ✨ Природу усилим по флагманской схеме (Clarity‑Upscaler x4).\n"
+        "Выбери режим ниже и пришли фото (для Flux можно просто текст).",
         reply_markup=KB
     )
 
-@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance", "🌄 Epic Landscape Flux", "🏞 Ultra HDR", "📸 Clean Restore"])
+@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance", "🌄 Epic Landscape Flux", "📸 Clean Restore"])
 async def on_choose(m: types.Message):
     uid = m.from_user.id
     if "Nature Enhance" in m.text:
@@ -167,58 +201,58 @@ async def on_choose(m: types.Message):
         await m.answer("Ок! Пришли фото. ⛰️🌿")
     elif "Epic Landscape Flux" in m.text:
         WAIT[uid] = {"effect": "flux"}
-        await m.answer("Пришли подпись для пейзажа (или просто текст без фото).")
-    elif "Ultra HDR" in m.text:
-        WAIT[uid] = {"effect": "hdr"}
-        await m.answer("Пришли фото, можно с подписью для HDR.")
+        await m.answer("Пришли подпись-описание пейзажа (или просто текст без фото) — сгенерю кадр.")
     elif "Clean Restore" in m.text:
         WAIT[uid] = {"effect": "clean"}
-        await m.answer("Пришли фото. Уберу шум/мыло.")
+        await m.answer("Пришли фото. Уберу шум/мыло аккуратно.")
 
 @dp.message_handler(content_types=["photo"])
 async def on_photo(m: types.Message):
     uid = m.from_user.id
-    st = WAIT.get(uid)
-    if not st:
-        await m.reply("Сначала выбери режим на клавиатуре ⬇️", reply_markup=KB)
+    state = WAIT.get(uid)
+    if not state:
+        await m.reply("Выбери режим на клавиатуре ниже и затем пришли фото.", reply_markup=KB)
         return
 
-    effect = st["effect"]
+    effect = state.get("effect")
     caption = (m.caption or "").strip()
-    await m.reply("⏳ Обрабатываю...")
 
+    await m.reply("⏳ Обрабатываю...")
     try:
         if effect == "nature":
-            out_url = await run_nature_enhance_pipeline(m.photo[-1].file_id)
+            out_url = await run_nature_clarity(m.photo[-1].file_id)
             await send_image_by_url(m, out_url)
         elif effect == "flux":
-            out_url = run_epic_landscape_flux(caption)
-            await send_image_by_url(m, out_url)
-        elif effect == "hdr":
-            out_url = run_ultra_hdr("", caption)
+            out_url = run_epic_landscape_flux(prompt_text=caption)
             await send_image_by_url(m, out_url)
         elif effect == "clean":
             public_url = await telegram_file_to_public_url(m.photo[-1].file_id)
             out_url = run_clean_restore(public_url)
             await send_image_by_url(m, out_url)
+        else:
+            await m.reply("Неизвестный режим.")
     except Exception:
         tb = traceback.format_exc(limit=20)
         await m.reply(f"🔥 Ошибка {effect}:\n```\n{tb}\n```", parse_mode="Markdown")
     finally:
         WAIT.pop(uid, None)
 
-# (старые пайплайны Flux/HDR/Clean оставляем как заглушки)
-def run_epic_landscape_flux(prompt_text: str) -> str:
-    flux_out = replicate.run(MODEL_FLUX, input={"prompt": prompt_text or "epic nature scene", "prompt_upsampling": True})
-    return pick_url(flux_out)
-
-def run_ultra_hdr(_url: str, hint_caption: str) -> str:
-    flux_out = replicate.run(MODEL_FLUX, input={"prompt": hint_caption or "Ultra HDR landscape", "prompt_upsampling": True})
-    return pick_url(flux_out)
-
-def run_clean_restore(public_url: str) -> str:
-    swin_out = replicate.run(MODEL_SWINIR, input={"image": public_url, "jpeg": "40", "noise": "15"})
-    return pick_url(swin_out)
+@dp.message_handler(content_types=["text"])
+async def on_text(m: types.Message):
+    uid = m.from_user.id
+    state = WAIT.get(uid)
+    if not state or state.get("effect") != "flux":
+        return
+    prompt = m.text.strip()
+    await m.reply("⏳ Генерирую пейзаж по описанию...")
+    try:
+        out_url = run_epic_landscape_flux(prompt_text=prompt)
+        await send_image_by_url(m, out_url)
+    except Exception:
+        tb = traceback.format_exc(limit=20)
+        await m.reply(f"🔥 Ошибка flux:\n```\n{tb}\n```", parse_mode="Markdown")
+    finally:
+        WAIT.pop(uid, None)
 
 if __name__ == "__main__":
     print(">> Starting polling...")
