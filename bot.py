@@ -124,7 +124,7 @@ async def run_nature_enhance_with_clarity(file_id: str) -> str:
         "resemblance": 0.55,                    # сохраняем реализм сцены
         "tiling_width": 112,
         "tiling_height": 144,
-        "sd_model": "epicrealism_naturalSinRC1VAE.safetensors [84d76a0328]",
+        "sd_model": "juggernaut_reborn.safetensors [338b85bc4f]",
         "scheduler": "DPM++ 3M SDE Karras",
         "num_inference_steps": 22,             # +чуть больше шагов
         "seed": 1337,
