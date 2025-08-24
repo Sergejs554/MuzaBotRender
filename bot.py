@@ -108,7 +108,7 @@ async def run_nature_enhance_with_clarity(file_id: str) -> str:
 
     # PROMPT с лорами (влияют на детали/рендер)
     prompt_text = (
-        "masterpiece, best quality, highres,\n"
+        "masterpiece, best quality, highres,dramatic deep colors,\n"
         "<lora:more_details:0.5>\n"
         "<lora:SDXLrender_v2.0:1>"
     )
@@ -120,7 +120,7 @@ async def run_nature_enhance_with_clarity(file_id: str) -> str:
         "negative_prompt": negative,
         "scale_factor": 2,                     # апскейл ×2 (мягче, чем x4; меньше артефактов)
         "dynamic": 6,                          # HDR/динамика как в примере
-        "creativity": 0.35,
+        "creativity": 0.4,
         "resemblance": 0.6,                    # сохраняем реализм сцены
         "tiling_width": 112,
         "tiling_height": 144,
