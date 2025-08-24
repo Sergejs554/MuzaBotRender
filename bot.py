@@ -120,8 +120,8 @@ async def run_nature_enhance_with_clarity(file_id: str) -> str:
         "negative_prompt": negative,
         "scale_factor": 2,                     # апскейл ×2 (мягче, чем x4; меньше артефактов)
         "dynamic": 6,                          # HDR/динамика как в примере
-        "creativity": 0.35,
-        "resemblance": 0.55,                    # сохраняем реализм сцены
+        "creativity": 0.25,
+        "resemblance": 0.65,                    # сохраняем реализм сцены
         "tiling_width": 112,
         "tiling_height": 144,
         "sd_model": "juggernaut_reborn.safetensors [338b85bc4f]",
