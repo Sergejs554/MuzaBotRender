@@ -132,27 +132,31 @@ async def run_nature_clarity(file_id: str) -> str:
     try:
         # Фокусный промпт — короткий и точный (микродеталь + реализм + HDR баланс)
         prompt = (
-            "ultra-realistic clarity, preserve micro-textures (leaves, water ripples, clouds), "
-            "deep but natural colors, balanced HDR, no halos, no plastic smoothing, no oversharpen"
+            "masterpiece, best quality, highres, <lora:more_details:0.5> <lora:SDXLrender_v2.0:1>, "
         )
         negative_prompt = (
             "low quality, blurry, watercolor, smudged, noise, artifact, oversaturated, "
-            "cartoonish, fake details, halos, plastic skin"
+            "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
         )
 
         with open(tmp_path, "rb") as f:
             out = replicate.run(
                 MODEL_CLARITY,
-                input={
-                    "image": f,                 # подаём как файл — надёжнее чем внешняя ссылка
-                    "prompt": prompt,
-                    "negative_prompt": negative_prompt,
-                    "scale_factor": 4,          # x4 upscale
-                    "dynamic": 8,               # HDR/тональный драйв (6 по умолчанию; 8 — чуть мощнее)
-                    "creativity": 0.25,         # меньше «фантазии», больше сохранения оригинала
-                    "resemblance": 0.65,        # держим идентичность сцены
-                    "scheduler": "DPM++ 3M SDE Karras",
-                    "num_inference_steps": 22   # чуть выше дефолта для стабильных деталей
+                input = {
+                    "image": <URL_ИЛИ_ФАЙЛ>,
+                    "prompt": "masterpiece, best quality, highres, <lora:more_details:0.5> <lora:SDXLrender_v2.0:1>",
+                    "negative_prompt": "(worst quality, low quality, normal quality:2) JuggernautNegative-neg",
+                    "scale_factor": 2,
+                    "dynamic": 6,
+                    "creativity": 0.35,
+                    "resemblance": 0.6,
+                    "scheduler": "DPM++ 2M Karras",
+                    "num_inference_steps": 18,
+                    "seed": 1337,
+                    "tiling_width": 16,
+                    "tiling_height": 16,
+                    "sd_model": "juggernaut_reborn.safetensors [338b85bc4f]"
+                
                     # seed опускаем, пусть будет рандом (меньше повторов)
                 }
             )
