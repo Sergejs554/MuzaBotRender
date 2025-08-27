@@ -1,4 +1,4 @@
-# bot.py — Nature Inspire: (2.0) Clarity→Refiner и WOW Enhance (с крутилкой)
+# bot.py — Nature Inspire: (2.0) Clarity-only и WOW Enhance с крутилкой
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
@@ -24,44 +24,42 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 # ---------- MODELS ----------
-MODEL_CLARITY  = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
-MODEL_REFINER  = "fermatresearch/magic-image-refiner:507ddf6f977a7e30e46c0daefd30de7d563c72322f9e4cf7cbac52ef0f667b13"
+# Nature Enhance 2.0 = Clarity Upscaler (как было)
+MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
 
 # ---------- TUNABLES ----------
-INPUT_MAX_SIDE       = 1536                 # ресайз входа перед моделями
-FINAL_TELEGRAM_LIMIT = 10 * 1024 * 1024     # 10MB лимит телеги
+INPUT_MAX_SIDE       = 1536                 # ресайз перед моделями Replicate
+FINAL_TELEGRAM_LIMIT = 10 * 1024 * 1024     # 10MB
 
-# Clarity (бережные настройки)
+# Clarity (как в твоём исходном коде, бережные)
 CL_SCALE_FACTOR      = 2
-CL_DYNAMIC           = 5.0
-CL_CREATIVITY        = 0.22
-CL_RESEMBLANCE       = 0.72
+CL_DYNAMIC           = 6.0
+CL_CREATIVITY        = 0.25
+CL_RESEMBLANCE       = 0.65
 CL_TILING_W          = 112
 CL_TILING_H          = 144
-CL_STEPS             = 20
+CL_STEPS             = 22
 CL_SD_MODEL          = "juggernaut_reborn.safetensors [338b85bc4f]"
 CL_SCHEDULER         = "DPM++ 3M SDE Karras"
-CL_LORA_MORE_DETAILS = 0.45
-CL_LORA_RENDER       = 0.90
+CL_LORA_MORE_DETAILS = 0.50
+CL_LORA_RENDER       = 1.00
+CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
 
-REFINER_PROMPT = (
-    "enhance photo clarity, natural detail, preserve realistic colors, "
-    "no plastic look, DSLR-like rendering, avoid over-sharpening"
-)
+# WOW — уровни силы (кнопки: Низкая/Средняя/Высокая)
+WOW_LEVEL_LOW    = 0.60
+WOW_LEVEL_MED    = 0.80
+WOW_LEVEL_HIGH   = 1.10   # просил 1.1 — сделал так
 
-# WOW — глобальная ручка интенсивности (0.0..1.2)
-WOW_LOW    = 0.60
-WOW_MEDIUM = 0.80
-WOW_HIGH   = 1.00   # текущий «эталонный» вау
-# Внутренние коэффициенты WOW (можешь тонко настраивать)
+# База «вау»-эффекта (можешь менять вручную)
 WOW_BASE = {
-    "vibrance": 1.18,      # «вибранс» (щадящая насыщенность)
-    "contrast": 1.10,      # глобальный контраст
-    "brightness": 1.06,    # общий свет
-    "log_a": 3.2,          # сила лог-тонмапа (HDR)
-    "bloom": 0.12,         # highlight bloom/halation
-    "microcontrast": 0.28, # доля высоких частот
-    "unsharp_percent": 120 # финальный микрошарп
+    "vibrance_gain":   0.18,   # сколько добавляем «вибранса» (щадящая насыщенность)
+    "contrast_gain":   0.10,   # глобальный контраст
+    "brightness_gain": 0.04,   # общий свет
+    "curve_amount":    0.18,   # S-кривая (плёночная)
+    "log_a":           2.8,    # лог-тонмап (HDR) — чем выше, тем сильнее
+    "microcontrast":   0.22,   # локальный контраст (high-pass blend)
+    "blur_radius":     1.6,    # базовый радиус гаусса для high-pass
+    "unsharp_percent": 110     # финальный Unsharp
 }
 
 # ---------- STATE ----------
@@ -130,84 +128,88 @@ def pick_first_url(output) -> str:
         return str(output)
 
 # ---------- WOW PIPELINE (локальный) ----------
-def _apply_vibrance(img: Image.Image, amount: float) -> Image.Image:
-    # «вибранс»: усиливаем слабонасыщенные пиксели сильнее
-    arr = np.asarray(img).astype(np.float32) / 255.0
-    mx = arr.max(axis=-1, keepdims=True)
-    mn = arr.min(axis=-1, keepdims=True)
-    sat = (mx - mn)
-    w = 1.0 - sat
-    sat_boost = amount ** w  # плавное усиление
-    mean = arr.mean(axis=-1, keepdims=True)
-    arr = mean + (arr - mean) * sat_boost
-    arr = np.clip(arr, 0, 1)
-    return Image.fromarray((arr * 255).astype(np.uint8))
+def _vibrance(img_arr: np.ndarray, gain: float) -> np.ndarray:
+    # «вибранс»: усиливаем низконасыщенные области сильнее
+    mx = img_arr.max(axis=-1, keepdims=True)
+    mn = img_arr.min(axis=-1, keepdims=True)
+    sat = mx - mn                               # 0..1
+    w = 1.0 - sat                               # серые области получают больший буст
+    mean = img_arr.mean(axis=-1, keepdims=True)
+    # масштабируем от центра, чтобы не уводить баланс
+    boost = 1.0 + gain * w
+    out = mean + (img_arr - mean) * boost
+    return np.clip(out, 0.0, 1.0)
 
-def wow_enhance_path(orig_path: str, effect_strength: float = WOW_HIGH) -> str:
+def _s_curve(x: np.ndarray, amt: float) -> np.ndarray:
+    # плавная S-кривая: mix линейного и smoothstep
+    y = x*(1-amt) + (3*x*x - 2*x*x*x)*amt
+    return np.clip(y, 0.0, 1.0)
+
+def wow_enhance_path(orig_path: str, strength: float) -> str:
     """
-    WOW: мягкий HDR + vibrance + локальный контраст + лёгкий bloom + шарп.
-    Все коэффициенты масштабируются effect_strength (0.6, 0.8, 1.0).
+    WOW: натуральный «вау» без пластика. Всё масштабируется параметром strength.
     """
-    s = float(effect_strength)
+    s = float(strength)
     base = Image.open(orig_path).convert("RGB")
     base = ImageOps.exif_transpose(base)
 
-    # === HDR (лог-тонмап) ===
-    arr = np.asarray(base).astype(np.float32)/255.0
-    luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-    a = WOW_BASE["log_a"] * s
-    y_new = np.log1p(a * luma) / (np.log1p(a) + 1e-8)
-    ratio = y_new / np.maximum(luma, 1e-6)
-    arr = np.clip(arr * ratio[...,None], 0, 1)
+    # в numpy
+    arr = np.asarray(base).astype(np.float32) / 255.0
+
+    # 1) лёгкий HDR-тонмап (лог по луме)
+    l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    a = max(1.0, WOW_BASE["log_a"] * s)
+    y = np.log1p(a*l) / (np.log1p(a) + 1e-8)
+    ratio = y / np.maximum(l, 1e-6)
+    arr = np.clip(arr * ratio[...,None], 0.0, 1.0)
+
+    # 2) S-кривая (киношная глубина)
+    arr = _s_curve(arr, amt= WOW_BASE["curve_amount"] * s)
+
+    # 3) Vibrance (щадящая насыщенность)
+    arr = _vibrance(arr, gain= WOW_BASE["vibrance_gain"] * s)
+
+    # 4) Контраст/яркость
+    arr = np.clip(arr, 0.0, 1.0)
     im = Image.fromarray((arr*255).astype(np.uint8))
+    im = ImageEnhance.Contrast(im).enhance(1.0 + WOW_BASE["contrast_gain"] * s)
+    im = ImageEnhance.Brightness(im).enhance(1.0 + WOW_BASE["brightness_gain"] * s)
 
-    # === Vibrance / Contrast / Brightness ===
-    im = _apply_vibrance(im, amount= WOW_BASE["vibrance"]**s )
-    im = ImageEnhance.Contrast(im).enhance( 1.0 + (WOW_BASE["contrast"]-1.0)*s )
-    im = ImageEnhance.Brightness(im).enhance( 1.0 + (WOW_BASE["brightness"]-1.0)*s )
+    # 5) Локальный «кларити» (high-pass)
+    blur_r = WOW_BASE["blur_radius"] + 2.2*s
+    blurred = im.filter(ImageFilter.GaussianBlur(radius=blur_r))
+    hp = ImageChops.subtract(im, blurred)
+    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(90 + 80*s), threshold=3))
+    im = Image.blend(im, hp, min(0.5, WOW_BASE["microcontrast"] * s))
 
-    # === Micro-contrast ===
-    blur = im.filter(ImageFilter.GaussianBlur(radius=1.2 + 2.8*s))
-    hp = ImageChops.subtract(im, blur)
-    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(90+120*s), threshold=3))
-    im = Image.blend(im, hp, min(0.45, WOW_BASE["microcontrast"]*s))
-
-    # === Bloom (хайлайты) — деликатно ===
-    if WOW_BASE["bloom"] > 0:
-        glow_r = 1.5 + 6.0*s
-        glow = im.filter(ImageFilter.GaussianBlur(radius=glow_r))
-        im = Image.blend(im, ImageChops.screen(im, glow), WOW_BASE["bloom"]*s*0.7)
-
-    # === Финальный микрошарп ===
-    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(WOW_BASE["unsharp_percent"]*s), threshold=2))
+    # 6) Финальный микрошарп
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(WOW_BASE["unsharp_percent"] * s), threshold=2))
 
     fd, out_path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(out_path, "JPEG", quality=95, optimize=True)
     return out_path
 
 # ---------- PIPELINES ----------
-async def run_nature_enhance_v2(file_id: str) -> str:
+async def run_nature_enhance_v2_clarity_only(file_id: str) -> str:
     """
-    Nature Enhance 2.0: Clarity (бережно) → Magic Image Refiner
+    Nature Enhance 2.0 — как было: CLARITY UPSCALER с LoRA, без доп. шагов.
     """
     local_in = await download_tg_photo(file_id)
     resize_inplace(local_in, INPUT_MAX_SIDE)
 
-    # 1) Clarity
     prompt_text = (
         "masterpiece, best quality, highres,\n"
         f"<lora:more_details:{CL_LORA_MORE_DETAILS}>\n"
         f"<lora:SDXLrender_v2.0:{CL_LORA_RENDER}>"
     )
-    negative = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
     try:
         with open(local_in, "rb") as f:
-            cl_out = replicate.run(
+            out = replicate.run(
                 MODEL_CLARITY,
                 input={
                     "image": f,
                     "prompt": prompt_text,
-                    "negative_prompt": negative,
+                    "negative_prompt": CL_NEGATIVE,
                     "scale_factor": CL_SCALE_FACTOR,
                     "dynamic": CL_DYNAMIC,
                     "creativity": CL_CREATIVITY,
@@ -224,35 +226,19 @@ async def run_nature_enhance_v2(file_id: str) -> str:
                     "output_format": "png",
                 }
             )
-        cl_url  = pick_first_url(cl_out)
-        cl_path = download_to_temp(cl_url)
+        url = pick_first_url(out)
+        out_path = download_to_temp(url)
     finally:
         try: os.remove(local_in)
         except: pass
 
-    # 2) Refiner
-    try:
-        with open(cl_path, "rb") as f:
-            ref_out = replicate.run(
-                MODEL_REFINER,
-                input={"image": f, "prompt": REFINER_PROMPT}
-            )
-        ref_url = pick_first_url(ref_out)
-        ref_path = download_to_temp(ref_url)
-    finally:
-        try: os.remove(cl_path)
-        except: pass
-
-    return ref_path
+    return out_path
 
 async def run_wow(file_id: str, strength: float) -> str:
-    """
-    WOW Enhance локально по оригиналу (без генеративщины).
-    """
     local_in = await download_tg_photo(file_id)
     resize_inplace(local_in, INPUT_MAX_SIDE)
     try:
-        out_path = wow_enhance_path(local_in, effect_strength=strength)
+        out_path = wow_enhance_path(local_in, strength=strength)
     finally:
         try: os.remove(local_in)
         except: pass
@@ -279,8 +265,8 @@ KB_STRENGTH = ReplyKeyboardMarkup(
 async def on_start(m: types.Message):
     await m.answer(
         "Nature Inspire 🌿\n"
-        "• Nature Enhance 2.0 — Clarity → Refiner (бережная про-камера)\n"
-        "• WOW Enhance — HDR+Vibrance+Depth (с крутилкой силы)\n"
+        "• Nature Enhance 2.0 — Clarity Upscaler (как было)\n"
+        "• WOW Enhance — сочность+глубина (с крутилкой силы)\n"
         "Выбери режим.",
         reply_markup=KB_MAIN
     )
@@ -306,11 +292,11 @@ async def on_strength(m: types.Message):
         await m.answer("Главное меню.", reply_markup=KB_MAIN)
         return
 
-    strength = WOW_MEDIUM
-    if m.text == "Низкая":  strength = WOW_LOW
-    if m.text == "Высокая": strength = WOW_HIGH
+    strength = WOW_LEVEL_MED
+    if m.text == "Низкая":  strength = WOW_LEVEL_LOW
+    if m.text == "Высокая": strength = WOW_LEVEL_HIGH
 
-    WAIT[uid] = {"effect": "wow", "strength": strength}
+    WAIT[uid] = {"effect": "wow", "strength": float(strength)}
     await m.answer("Пришли фото — сделаю WOW Enhance 🌿", reply_markup=KB_MAIN)
 
 @dp.message_handler(content_types=["photo"])
@@ -324,9 +310,9 @@ async def on_photo(m: types.Message):
     await m.reply("⏳ Обрабатываю...")
     try:
         if st["effect"] == "ne2":
-            out_path = await run_nature_enhance_v2(m.photo[-1].file_id)
+            out_path = await run_nature_enhance_v2_clarity_only(m.photo[-1].file_id)
         else:
-            out_path = await run_wow(m.photo[-1].file_id, strength=float(st.get("strength", WOW_MEDIUM)))
+            out_path = await run_wow(m.photo[-1].file_id, strength=float(st.get("strength", WOW_LEVEL_MED)))
 
         safe = ensure_size_under_telegram_limit(out_path)
         await m.reply_photo(InputFile(safe))
