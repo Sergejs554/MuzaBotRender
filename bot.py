@@ -1,4 +1,4 @@
-# bot.py — Nature Inspire: (2.0) Clarity-only и WOW Enhance с крутилкой
+# bot.py — Nature Inspire: Clarity-only (2.0) и WOW Enhance (топ-пайплайн с крутилкой)
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
@@ -31,7 +31,7 @@ MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208
 INPUT_MAX_SIDE       = 1536                 # ресайз перед моделями Replicate
 FINAL_TELEGRAM_LIMIT = 10 * 1024 * 1024     # 10MB
 
-# Clarity (как в твоём исходном коде, бережные)
+# Clarity (твои бережные настройки)
 CL_SCALE_FACTOR      = 2
 CL_DYNAMIC           = 6.0
 CL_CREATIVITY        = 0.25
@@ -46,21 +46,34 @@ CL_LORA_RENDER       = 1.00
 CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
 
 # WOW — уровни силы (кнопки: Низкая/Средняя/Высокая)
-WOW_LEVEL_LOW    = 1.3
-WOW_LEVEL_MED    = 1.6
-WOW_LEVEL_HIGH   = 1.9   # просил 1.1 — сделал так
+WOW_LEVEL_LOW    = 0.60
+WOW_LEVEL_MED    = 0.80
+WOW_LEVEL_HIGH   = 1.10   # как просил
 
-# База «вау»-эффекта (можешь менять вручную)
+# База «вау»-эффекта (топ-пайплайн). Все множители масштабируются strength.
 WOW_BASE = {
-    "vibrance_gain":   0.18,   # сколько добавляем «вибранса» (щадящая насыщенность)
-    "contrast_gain":   0.10,   # глобальный контраст
-    "brightness_gain": 0.04,   # общий свет
-    "curve_amount":    0.18,   # S-кривая (плёночная)
-    "log_a":           2.8,    # лог-тонмап (HDR) — чем выше, тем сильнее
-    "microcontrast":   0.22,   # локальный контраст (high-pass blend)
-    "blur_radius":     1.6,    # базовый радиус гаусса для high-pass
-    "unsharp_percent": 110     # финальный Unsharp
+    # HDR тонмап (лог по луме)
+    "log_a":            3.4,    # сила HDR-кривой (мягкая компрессия хайлайтов, подъём теней)
+    # Плёночная S-кривая (глубина)
+    "curve_amount":     0.22,
+    # Vibrance (щадящая насыщенность — больше там, где мало цвета)
+    "vibrance_gain":    0.22,
+    # Глобальные
+    "contrast_gain":    0.12,
+    "brightness_gain":  0.06,
+    # Microcontrast (high-pass blend)
+    "microcontrast":    0.30,   # доля примеси HP
+    "hp_blur_base":     1.4,    # базовый радиус blur перед high-pass
+    # Bloom (хайлайты, сияние)
+    "bloom_amount":     0.12,
+    "bloom_radius":     2.0,    # базовый радиус
+    # Финальный микрошарп
+    "unsharp_percent":  130,
 }
+
+# Анти-серость: если средняя яркость после тонмапа падает >2% — деликатно компенсируем
+ANTI_GREY_TOL = 0.98
+ANTI_GREY_CAP = 1.35
 
 # ---------- STATE ----------
 # user_id -> {'effect': 'ne2'|'wow_menu'|'wow', 'strength': float}
@@ -127,63 +140,70 @@ def pick_first_url(output) -> str:
     except Exception:
         return str(output)
 
-# ---------- WOW PIPELINE (локальный) ----------
-def _vibrance(img_arr: np.ndarray, gain: float) -> np.ndarray:
-    # «вибранс»: усиливаем низконасыщенные области сильнее
-    mx = img_arr.max(axis=-1, keepdims=True)
-    mn = img_arr.min(axis=-1, keepdims=True)
-    sat = mx - mn                               # 0..1
-    w = 1.0 - sat                               # серые области получают больший буст
-    mean = img_arr.mean(axis=-1, keepdims=True)
-    # масштабируем от центра, чтобы не уводить баланс
+# ---------- WOW PIPELINE (Топ) ----------
+def _vibrance(arr: np.ndarray, gain: float) -> np.ndarray:
+    # Усиливаем низконасыщенные области сильнее, высоко-насыщенные — деликатно
+    mx = arr.max(axis=-1, keepdims=True)
+    mn = arr.min(axis=-1, keepdims=True)
+    sat = mx - mn
+    w = 1.0 - sat
+    mean = arr.mean(axis=-1, keepdims=True)
     boost = 1.0 + gain * w
-    out = mean + (img_arr - mean) * boost
+    out = mean + (arr - mean) * boost
     return np.clip(out, 0.0, 1.0)
 
 def _s_curve(x: np.ndarray, amt: float) -> np.ndarray:
-    # плавная S-кривая: mix линейного и smoothstep
-    y = x*(1-amt) + (3*x*x - 2*x*x*x)*amt
-    return np.clip(y, 0.0, 1.0)
+    return np.clip(x*(1-amt) + (3*x*x - 2*x*x*x)*amt, 0.0, 1.0)
 
 def wow_enhance_path(orig_path: str, strength: float) -> str:
-    """
-    WOW: натуральный «вау» без пластика. Всё масштабируется параметром strength.
-    """
     s = float(strength)
     base = Image.open(orig_path).convert("RGB")
     base = ImageOps.exif_transpose(base)
-
-    # в numpy
     arr = np.asarray(base).astype(np.float32) / 255.0
 
-    # 1) лёгкий HDR-тонмап (лог по луме)
-    l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    # Базовая яркость для анти-серости
+    in_luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    in_mean = float(in_luma.mean())
+
+    # 1) HDR (лог-тонмап по луме)
     a = max(1.0, WOW_BASE["log_a"] * s)
-    y = np.log1p(a*l) / (np.log1p(a) + 1e-8)
-    ratio = y / np.maximum(l, 1e-6)
+    luma = in_luma
+    y = np.log1p(a*luma) / (np.log1p(a) + 1e-8)
+    ratio = y / np.maximum(luma, 1e-6)
     arr = np.clip(arr * ratio[...,None], 0.0, 1.0)
 
-    # 2) S-кривая (киношная глубина)
+    # 2) S-кривая (плёночная глубина)
     arr = _s_curve(arr, amt= WOW_BASE["curve_amount"] * s)
 
-    # 3) Vibrance (щадящая насыщенность)
+    # 3) Vibrance
     arr = _vibrance(arr, gain= WOW_BASE["vibrance_gain"] * s)
 
-    # 4) Контраст/яркость
-    arr = np.clip(arr, 0.0, 1.0)
+    # 4) Контраст / Яркость (деликатно)
     im = Image.fromarray((arr*255).astype(np.uint8))
     im = ImageEnhance.Contrast(im).enhance(1.0 + WOW_BASE["contrast_gain"] * s)
     im = ImageEnhance.Brightness(im).enhance(1.0 + WOW_BASE["brightness_gain"] * s)
 
-    # 5) Локальный «кларити» (high-pass)
-    blur_r = WOW_BASE["blur_radius"] + 2.2*s
-    blurred = im.filter(ImageFilter.GaussianBlur(radius=blur_r))
+    # 5) Microcontrast (high-pass)
+    hp_r = WOW_BASE["hp_blur_base"] + 2.0*s
+    blurred = im.filter(ImageFilter.GaussianBlur(radius=hp_r))
     hp = ImageChops.subtract(im, blurred)
-    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(90 + 80*s), threshold=3))
-    im = Image.blend(im, hp, min(0.5, WOW_BASE["microcontrast"] * s))
+    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(100 + 110*s), threshold=3))
+    im = Image.blend(im, hp, min(0.6, WOW_BASE["microcontrast"] * s))
 
-    # 6) Финальный микрошарп
+    # 6) Bloom (хайлайты)
+    if WOW_BASE["bloom_amount"] > 0:
+        glow_r = WOW_BASE["bloom_radius"] + 5.0*s
+        glow = im.filter(ImageFilter.GaussianBlur(radius=glow_r))
+        im = Image.blend(im, ImageChops.screen(im, glow), WOW_BASE["bloom_amount"] * s)
+
+    # 7) Финальный микрошарп
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(WOW_BASE["unsharp_percent"] * s), threshold=2))
+
+    # Анти-серость: если итог темнее исходного, слегка компенсируем
+    out_mean = np.asarray(im.convert("L")).astype(np.float32).mean() / 255.0
+    if out_mean < in_mean * ANTI_GREY_TOL:
+        gain = min(ANTI_GREY_CAP, max(1.00, (in_mean / max(out_mean, 1e-6)) ** 0.85))
+        im = ImageEnhance.Brightness(im).enhance(gain)
 
     fd, out_path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(out_path, "JPEG", quality=95, optimize=True)
@@ -266,7 +286,7 @@ async def on_start(m: types.Message):
     await m.answer(
         "Nature Inspire 🌿\n"
         "• Nature Enhance 2.0 — Clarity Upscaler (как было)\n"
-        "• WOW Enhance — сочность+глубина (с крутилкой силы)\n"
+        "• WOW Enhance — HDR+Vibrance+Depth+Bloom (крутилка силы)\n"
         "Выбери режим.",
         reply_markup=KB_MAIN
     )
