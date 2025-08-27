@@ -1,7 +1,7 @@
-# bot.py — Nature Inspire (Clarity + HDR) и Nature Inspire 2.0 (HDR only) + ESRGAN
+# bot.py — Nature Inspire: ProShot Lens (local) & ProShot + Clarity (+ESRGAN)
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
 
-import os, logging, tempfile, urllib.request, traceback
+import os, logging, tempfile, urllib.request, traceback, math
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps, ImageEnhance, ImageChops
 import replicate
@@ -27,43 +27,38 @@ dp = Dispatcher(bot)
 MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
 MODEL_ESRGAN  = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
 
-# ---------- TUNABLES (крутилки) ----------
-# Общие ограничения
-INPUT_MAX_SIDE        = 1536                    # ресайз перед моделями Replicate
-FINAL_TELEGRAM_LIMIT  = 10 * 1024 * 1024        # 10MB
+# ---------- TUNABLES ----------
+INPUT_MAX_SIDE        = 1536
+FINAL_TELEGRAM_LIMIT  = 10 * 1024 * 1024
+ESRGAN_MAX_INPUT_PIXELS = 2_000_000
+UPSCALE_AFTER          = True
+UPSCALE_SCALE          = 2
 
-# Clarity
+# Clarity knobs
 CLARITY_SCALE_FACTOR     = 2
-CLARITY_DYNAMIC          = 6.0
-CLARITY_CREATIVITY       = 0.25
-CLARITY_RESEMBLANCE      = 0.65
+CLARITY_DYNAMIC          = 5.0
+CLARITY_CREATIVITY       = 0.22
+CLARITY_RESEMBLANCE      = 0.72
 CLARITY_TILING_W         = 112
 CLARITY_TILING_H         = 144
-CLARITY_STEPS            = 22
+CLARITY_STEPS            = 20
 CLARITY_SD_MODEL         = "juggernaut_reborn.safetensors [338b85bc4f]"
 CLARITY_SCHEDULER        = "DPM++ 3M SDE Karras"
-CLARITY_MORE_DETAILS_LORA= 0.5                   # <lora:more_details:x>
-CLARITY_RENDER_LORA      = 1.0                   # <lora:SDXLrender_v2.0:x>
+CLARITY_MORE_DETAILS_LORA= 0.45
+CLARITY_RENDER_LORA      = 0.9
 
-# HDR сила (0..1)
-HDR_STRENGTH_LOW   = 0.35
-HDR_STRENGTH_MED   = 0.60
-HDR_STRENGTH_HIGH  = 0.85
-
-# Доп. «ручки» внутри HDR
-HDR_EXPOSURE_BASE  = 1.06                        # глобальная экспозиция (1.00..1.40)
-HDR_EXPOSURE_GAIN  = 0.30                        # вклад от strength в экспозицию
-HDR_LOG_A_BASE     = 2.0                         # параметр лог-томапа (2..6)
-HDR_LOG_A_GAIN     = 3.0
-
-# ESRGAN
-UPSCALE_AFTER_HDR        = True                  # финализировать ESRGAN
-UPSCALE_SCALE            = 2                     # 2 или 4
-ESRGAN_MAX_INPUT_PIXELS  = 2_000_000             # безопасный лимит входа для ESRGAN
+# ProShot Lens knobs (меняй цифрами)
+PRO_CONTRAST    = 1.10   # глобальный контраст
+PRO_FILMIC_CURVE= 0.15   # S-кривая (0..0.35)
+PRO_WARMTH      = 1.06   # тёплый баланс (R↑, B↓)
+PRO_VIBRANCE    = 1.12   # «вибранс» (щадящая насыщенность)
+PRO_HALATION    = 0.18   # блум хайлайтов (0..0.35)
+PRO_GRAIN       = 0.06   # плёночное зерно (0..0.15)
+PRO_SHARP       = 110    # Unsharp percent (0..180)
+PRO_BLEND       = 0.15   # смешивание с оригиналом (0..0.35) — «человечность»
 
 # ---------- STATE ----------
-# user_id -> {'effect': ..., 'strength': float}
-WAIT = {}
+WAIT = {}  # user_id -> {'effect': 'pro'|'clarity_pro', 'strength': 'low|med|high'}
 
 # ---------- HELPERS ----------
 def tg_public_url(file_path: str) -> str:
@@ -126,89 +121,14 @@ def pick_first_url(output) -> str:
     except Exception:
         return str(output)
 
-# ---------- HDR (лог-тонмап, с анти-«серостью») ----------
-def _pil_gaussian(img: Image.Image, radius: float) -> Image.Image:
-    small = img.resize((max(8, img.width//2), max(8, img.height//2)), Image.LANCZOS)
-    small = small.filter(ImageFilter.GaussianBlur(radius=radius*0.75))
-    return small.resize(img.size, Image.LANCZOS)
-
-def hdr_enhance_path(orig_path: str, strength: float = 0.6) -> str:
-    """
-    Натуральный HDR без «пластика»:
-      1) глобальная экспозиция (поднимаем midtones),
-      2) лог-тонмап на яркости (компресс хайлайтов, подъём теней),
-      3) локальный контраст мягко, немного насыщенности,
-      4) авто-компенсация яркости, если стало темнее.
-    """
-    im = Image.open(orig_path).convert("RGB")
-    im = ImageOps.exif_transpose(im)
-    arr = np.asarray(im).astype(np.float32) / 255.0
-
-    # базовая средняя яркость для контроля
-    in_luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-    in_mean = float(in_luma.mean())
-
-    # 1) глобальная экспозиция
-    exposure = HDR_EXPOSURE_BASE + HDR_EXPOSURE_GAIN * strength   # ~1.16..1.31
-    arr = np.clip(arr * exposure, 0.0, 1.0)
-
-    # 2) лог-тонмап по луме с сохранением цвета
-    luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-    a = HDR_LOG_A_BASE + HDR_LOG_A_GAIN * strength                 # 2..5.5
-    y_new = np.log1p(a * luma) / (np.log1p(a) + 1e-8)
-    ratio = y_new / np.maximum(luma, 1e-6)
-    arr *= ratio[..., None]
-    arr = np.clip(arr, 0.0, 1.0)
-
-    base = Image.fromarray((arr*255).astype(np.uint8))
-
-    # мягкие маски для донастройки теней/хайлайтов
-    l = np.asarray(base.convert("L")).astype(np.float32) / 255.0
-    sh = np.clip(1.0 - l*1.1, 0.0, 1.0)
-    hl = np.clip((l - 0.75)*2.0, 0.0, 1.0)
-    sh_mask = np.asarray(_pil_gaussian(Image.fromarray((sh*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
-    hl_mask = np.asarray(_pil_gaussian(Image.fromarray((hl*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
-
-    arr2 = np.asarray(base).astype(np.float32) / 255.0
-    sh_gain = 0.12 + 0.22*strength
-    hl_cut  = 0.06 + 0.12*strength
-    for c in range(3):
-        chan = arr2[...,c]
-        chan = chan + sh_mask * sh_gain * (1.0 - chan)
-        chan = chan - hl_mask * hl_cut * chan
-        arr2[...,c] = np.clip(chan, 0.0, 1.0)
-    base = Image.fromarray((arr2*255).astype(np.uint8))
-
-    # локальный контраст + лёгкая насыщенность
-    blurred = base.filter(ImageFilter.GaussianBlur(radius=1.3 + 2.8*strength))
-    hp = ImageChops.subtract(base, blurred)
-    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(110+100*strength), threshold=3))
-    mc_amount = 0.15 + 0.22*strength
-    base = Image.blend(base, hp, mc_amount)
-
-    base = base.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80+int(80*strength), threshold=2))
-    base = ImageEnhance.Color(base).enhance(1.06 + 0.16*strength)
-
-    # 4) если стало темнее — компенсируем
-    out_l = np.asarray(base.convert("L")).astype(np.float32)/255.0
-    out_mean = float(out_l.mean())
-    if out_mean < in_mean * 0.98:
-        gain = min(1.40, max(1.00, (in_mean / max(out_mean, 1e-6)) ** 0.85))
-        base = ImageEnhance.Brightness(base).enhance(gain)
-
-    fd, out_path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
-    base.save(out_path, "JPEG", quality=95, optimize=True)
-    return out_path
-
-# ---------- ESRGAN (безопасный вход под лимит GPU) ----------
+# ---------- ESRGAN (safe input) ----------
 def esrgan_upscale_path(path: str, scale: int = 2) -> str:
     im = Image.open(path).convert("RGB")
     im = ImageOps.exif_transpose(im)
     w, h = im.size
-    px = w * h
-    if px > ESRGAN_MAX_INPUT_PIXELS:
-        k = (ESRGAN_MAX_INPUT_PIXELS / px) ** 0.5
-        nw, nh = max(256, int(w * k)), max(256, int(h * k))
+    if w*h > ESRGAN_MAX_INPUT_PIXELS:
+        k = (ESRGAN_MAX_INPUT_PIXELS / (w*h)) ** 0.5
+        nw, nh = max(256, int(w*k)), max(256, int(h*k))
         im = im.resize((nw, nh), Image.LANCZOS)
         fd, safe_in = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
         im.save(safe_in, "JPEG", quality=95, optimize=True)
@@ -220,99 +140,170 @@ def esrgan_upscale_path(path: str, scale: int = 2) -> str:
         out = replicate.run(MODEL_ESRGAN, input={"image": bf, "scale": scale})
     url = pick_first_url(out)
     tmp = download_to_temp(url)
-
     if in_path != path:
         try: os.remove(in_path)
         except: pass
     return tmp
 
+# ---------- ProShot Lens (локально, «плёночный про-объектив») ----------
+def _apply_filmic_curve(arr, s=0.15):
+    # простая S-кривая: mix линейного и smoothstep
+    x = np.clip(arr, 0, 1)
+    y = x*(1-s) + (3*x*x - 2*x*x*x)*s
+    return np.clip(y, 0, 1)
+
+def _apply_warmth(arr, k=1.06):
+    # тёплый баланс: R↑, B↓ (деликатно, через матрицу)
+    r,g,b = arr[...,0], arr[...,1], arr[...,2]
+    r = np.clip(r * k, 0, 1)
+    b = np.clip(b / k, 0, 1)
+    return np.stack([r,g,b], axis=-1)
+
+def _vibrance(img: Image.Image, amount: float) -> Image.Image:
+    # «вибранс»: усиливаем мало-насыщенные пиксели больше, чем уже насыщенные
+    arr = np.asarray(img).astype(np.float32)/255.0
+    mx = arr.max(axis=-1, keepdims=True)
+    mn = arr.min(axis=-1, keepdims=True)
+    sat = (mx - mn)
+    w = 1.0 - sat                              # слабосат. пикселям — больший вес
+    sat_boost = 1.0 + (amount-1.0)*w
+    mean = arr.mean(axis=-1, keepdims=True)
+    arr = mean + (arr-mean)*sat_boost
+    arr = np.clip(arr, 0, 1)
+    return Image.fromarray((arr*255).astype(np.uint8))
+
+def _halation(img: Image.Image, strength: float) -> Image.Image:
+    if strength <= 0: return img
+    blur = img.filter(ImageFilter.GaussianBlur(radius=2.0 + 6.0*strength))
+    # выделяем хайлайты
+    g = blur.convert("L")
+    g = g.point(lambda v: int(max(0, v-200) * (255/55)))  # порог ~200
+    g = g.filter(ImageFilter.GaussianBlur(radius=1.0 + 3.0*strength))
+    glow = ImageChops.multiply(blur, Image.merge("RGB",(g,g,g)))
+    return Image.blend(img, glow, strength*0.6)
+
+def _add_grain(img: Image.Image, strength: float) -> Image.Image:
+    if strength <= 0: return img
+    w,h = img.size
+    noise = np.random.normal(0, strength*25.0, (h,w,1)).astype(np.float32)/255.0
+    arr = np.asarray(img).astype(np.float32)/255.0
+    arr = np.clip(arr + noise, 0, 1)
+    return Image.fromarray((arr*255).astype(np.uint8))
+
+def proshot_enhance_path(orig_path: str,
+                         contrast=PRO_CONTRAST,
+                         filmic=PRO_FILMIC_CURVE,
+                         warmth=PRO_WARMTH,
+                         vibrance=PRO_VIBRANCE,
+                         halation=PRO_HALATION,
+                         grain=PRO_GRAIN,
+                         sharp_percent=PRO_SHARP,
+                         blend=PRO_BLEND) -> str:
+    base = Image.open(orig_path).convert("RGB")
+    base = ImageOps.exif_transpose(base)
+
+    # 1) лёгкий контраст + S-кривая
+    im = ImageEnhance.Contrast(base).enhance(contrast)
+    arr = np.asarray(im).astype(np.float32)/255.0
+    arr = _apply_filmic_curve(arr, s=filmic)
+    arr = _apply_warmth(arr, k=warmth)
+    im = Image.fromarray((arr*255).astype(np.uint8))
+
+    # 2) vibrance (щадящая насыщенность)
+    im = _vibrance(im, vibrance)
+
+    # 3) halation/bloom по хайлайтам
+    im = _halation(im, halation)
+
+    # 4) микрошарп
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(sharp_percent), threshold=2))
+
+    # 5) плёночный grain
+    im = _add_grain(im, grain)
+
+    # 6) «человечность»: смешаем с оригиналом
+    out = Image.blend(base, im, max(0.0, min(1.0, blend)))
+
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    out.save(path, "JPEG", quality=95, optimize=True)
+    return path
+
 # ---------- PIPELINES ----------
-async def run_nature_enhance_clarity_hdr(file_id: str, strength: float) -> str:
-    # 1) качаем фото и ресайзим перед Replicate
+async def run_pro_lens_only(file_id: str) -> str:
+    local_in = await download_tg_photo(file_id)
+    resize_inplace(local_in, INPUT_MAX_SIDE)
+    try:
+        pro_path = proshot_enhance_path(local_in)
+    finally:
+        try: os.remove(local_in)
+        except: pass
+
+    if UPSCALE_AFTER:
+        up = esrgan_upscale_path(pro_path, scale=UPSCALE_SCALE)
+        try: os.remove(pro_path)
+        except: pass
+        pro_path = up
+    return pro_path
+
+async def run_pro_lens_with_clarity(file_id: str) -> str:
+    # 1) качаем и ресайзим
     local_in = await download_tg_photo(file_id)
     resize_inplace(local_in, INPUT_MAX_SIDE)
 
-    # 2) Clarity по файлу (контроль размера)
+    # 2) Clarity (мягкие настройки, ближе к реальности)
     prompt_text = (
         "masterpiece, best quality, highres,\n"
         f"<lora:more_details:{CLARITY_MORE_DETAILS_LORA}>\n"
         f"<lora:SDXLrender_v2.0:{CLARITY_RENDER_LORA}>"
     )
     negative = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
-
     with open(local_in, "rb") as f:
-        cl_out = replicate.run(
-            MODEL_CLARITY,
-            input={
-                "image": f,
-                "prompt": prompt_text,
-                "negative_prompt": negative,
-                "scale_factor": CLARITY_SCALE_FACTOR,
-                "dynamic": CLARITY_DYNAMIC,
-                "creativity": CLARITY_CREATIVITY,
-                "resemblance": CLARITY_RESEMBLANCE,
-                "tiling_width": CLARITY_TILING_W,
-                "tiling_height": CLARITY_TILING_H,
-                "sd_model": CLARITY_SD_MODEL,
-                "scheduler": CLARITY_SCHEDULER,
-                "num_inference_steps": CLARITY_STEPS,
-                "seed": 1337,
-                "downscaling": False,
-                "sharpen": 0,
-                "handfix": "disabled",
-                "output_format": "png",
-            }
-        )
+        out = replicate.run(MODEL_CLARITY, input={
+            "image": f,
+            "prompt": prompt_text,
+            "negative_prompt": negative,
+            "scale_factor": CLARITY_SCALE_FACTOR,
+            "dynamic": CLARITY_DYNAMIC,
+            "creativity": CLARITY_CREATIVITY,
+            "resemblance": CLARITY_RESEMBLANCE,
+            "tiling_width": CLARITY_TILING_W,
+            "tiling_height": CLARITY_TILING_H,
+            "sd_model": CLARITY_SD_MODEL,
+            "scheduler": CLARITY_SCHEDULER,
+            "num_inference_steps": CLARITY_STEPS,
+            "seed": 1337,
+            "downscaling": False,
+            "sharpen": 0,
+            "handfix": "disabled",
+            "output_format": "png",
+        })
     try: os.remove(local_in)
     except: pass
 
-    cl_url  = pick_first_url(cl_out)
+    cl_url  = pick_first_url(out)
     cl_path = download_to_temp(cl_url)
 
-    # 3) HDR
+    # 3) ProShot поверх Clarity
     try:
-        hdr_path = hdr_enhance_path(cl_path, strength=strength)
+        pro_path = proshot_enhance_path(cl_path)
     finally:
         try: os.remove(cl_path)
         except: pass
 
-    # 4) ESRGAN по флажку
-    if UPSCALE_AFTER_HDR:
-        up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
-        try: os.remove(hdr_path)
+    # 4) (опц.) апскейл
+    if UPSCALE_AFTER:
+        up = esrgan_upscale_path(pro_path, scale=UPSCALE_SCALE)
+        try: os.remove(pro_path)
         except: pass
-        hdr_path = up_path
-
-    return hdr_path
-
-async def run_nature_enhance_hdr_only(file_id: str, strength: float) -> str:
-    local_in = await download_tg_photo(file_id)
-    resize_inplace(local_in, INPUT_MAX_SIDE)
-    hdr_path = hdr_enhance_path(local_in, strength=strength)
-    try: os.remove(local_in)
-    except: pass
-
-    if UPSCALE_AFTER_HDR:
-        up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
-        try: os.remove(hdr_path)
-        except: pass
-        hdr_path = up_path
-
-    return hdr_path
+        pro_path = up
+    return pro_path
 
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("🌿 Nature Enhance (Clarity + HDR)")],
-        [KeyboardButton("🌿 Nature Enhance 2.0 (HDR only)")],
-    ],
-    resize_keyboard=True
-)
-
-KB_STRENGTH = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton("⬅️ Назад")],
-        [KeyboardButton("Низкая"), KeyboardButton("Средняя"), KeyboardButton("Высокая")],
+        [KeyboardButton("📸 ProShot Lens")],
+        [KeyboardButton("📸 ProShot + Clarity")],
+        # HDR убран из меню — добавим позже отдельной кнопкой
     ],
     resize_keyboard=True
 )
@@ -320,67 +311,40 @@ KB_STRENGTH = ReplyKeyboardMarkup(
 @dp.message_handler(commands=["start"])
 async def on_start(m: types.Message):
     await m.answer(
-        "Nature Inspire 🌿\n"
-        "• Nature Enhance — Clarity + натуральный HDR (+ESRGAN финал)\n"
-        "• Nature Enhance 2.0 — только натуральный HDR (+ESRGAN финал)\n"
-        "Выбери режим и силу эффекта.",
+        "Nature Inspire 📸\n"
+        "• ProShot Lens — плёночный про-объектив (натурально, без пластика)\n"
+        "• ProShot + Clarity — сначала Clarity, затем ProShot (+опц. апскейл)\n"
+        "Пришли фото после выбора режима.",
         reply_markup=KB_MAIN
     )
 
-@dp.message_handler(lambda m: m.text in [
-    "🌿 Nature Enhance (Clarity + HDR)",
-    "🌿 Nature Enhance 2.0 (HDR only)"
-])
+@dp.message_handler(lambda m: m.text in ["📸 ProShot Lens", "📸 ProShot + Clarity"])
 async def on_choose_mode(m: types.Message):
     uid = m.from_user.id
-    WAIT[uid] = {"effect": "clarity_menu" if "Clarity" in m.text else "hdr_menu"}
-    await m.answer("Выбери силу эффекта:", reply_markup=KB_STRENGTH)
-
-@dp.message_handler(lambda m: m.text in ["Низкая", "Средняя", "Высокая", "⬅️ Назад"])
-async def on_strength(m: types.Message):
-    uid = m.from_user.id
-    st = WAIT.get(uid)
-    if not st:
-        return
-    if m.text == "⬅️ Назад":
-        WAIT.pop(uid, None)
-        await m.answer("Главное меню.", reply_markup=KB_MAIN)
-        return
-
-    strength = HDR_STRENGTH_MED
-    if m.text == "Низкая":  strength = HDR_STRENGTH_LOW
-    if m.text == "Высокая": strength = HDR_STRENGTH_HIGH
-
-    if st["effect"] == "clarity_menu":
-        WAIT[uid] = {"effect": "clarity_hdr", "strength": strength}
-        await m.answer("Пришли фото — сделаю Nature Enhance (Clarity + HDR) 🌿", reply_markup=KB_MAIN)
-    elif st["effect"] == "hdr_menu":
-        WAIT[uid] = {"effect": "hdr_only", "strength": strength}
-        await m.answer("Пришли фото — сделаю Nature Enhance 2.0 (HDR only) 🌿", reply_markup=KB_MAIN)
+    WAIT[uid] = {"effect": "pro" if "Lens" in m.text else "clarity_pro"}
+    await m.answer("Ок! Пришли фото.")
 
 @dp.message_handler(content_types=["photo"])
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     st = WAIT.get(uid)
-    if not st or st.get("effect") not in ["clarity_hdr", "hdr_only"]:
-        await m.reply("Сначала выбери режим и силу эффекта ⬇️", reply_markup=KB_MAIN)
+    if not st or st.get("effect") not in ["pro", "clarity_pro"]:
+        await m.reply("Сначала выбери режим ⬇️", reply_markup=KB_MAIN)
         return
 
     await m.reply("⏳ Обрабатываю...")
     try:
-        strength = float(st.get("strength", HDR_STRENGTH_MED))
-        if st["effect"] == "clarity_hdr":
-            out_path = await run_nature_enhance_clarity_hdr(m.photo[-1].file_id, strength=strength)
+        if st["effect"] == "pro":
+            out_path = await run_pro_lens_only(m.photo[-1].file_id)
         else:
-            out_path = await run_nature_enhance_hdr_only(m.photo[-1].file_id, strength=strength)
+            out_path = await run_pro_lens_with_clarity(m.photo[-1].file_id)
 
-        safe_path = ensure_size_under_telegram_limit(out_path)
-        await m.reply_photo(InputFile(safe_path))
+        safe = ensure_size_under_telegram_limit(out_path)
+        await m.reply_photo(InputFile(safe))
         try:
             if os.path.exists(out_path): os.remove(out_path)
-            if safe_path != out_path and os.path.exists(safe_path): os.remove(safe_path)
+            if safe != out_path and os.path.exists(safe): os.remove(safe)
         except: pass
-
     except Exception:
         tb = traceback.format_exc(limit=20)
         await m.reply(f"🔥 Ошибка Nature Inspire:\n```\n{tb}\n```", parse_mode="Markdown")
