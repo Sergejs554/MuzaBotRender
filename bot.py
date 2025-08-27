@@ -29,8 +29,8 @@ MODEL_ESRGAN  = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff7
 
 # ---------- TUNABLES (крутилки) ----------
 # Общие ограничения
-INPUT_MAX_SIDE        = 1536   # ресайз перед моделями Replicate (fix размера)
-FINAL_TELEGRAM_LIMIT  = 10 * 1024 * 1024  # 10MB
+INPUT_MAX_SIDE        = 1536                    # ресайз перед моделями Replicate
+FINAL_TELEGRAM_LIMIT  = 10 * 1024 * 1024        # 10MB
 
 # Clarity
 CLARITY_SCALE_FACTOR     = 2
@@ -42,23 +42,24 @@ CLARITY_TILING_H         = 144
 CLARITY_STEPS            = 22
 CLARITY_SD_MODEL         = "juggernaut_reborn.safetensors [338b85bc4f]"
 CLARITY_SCHEDULER        = "DPM++ 3M SDE Karras"
-CLARITY_MORE_DETAILS_LORA= 0.5   # <lora:more_details:x>
-CLARITY_RENDER_LORA      = 1.0   # <lora:SDXLrender_v2.0:x>
+CLARITY_MORE_DETAILS_LORA= 0.5                   # <lora:more_details:x>
+CLARITY_RENDER_LORA      = 1.0                   # <lora:SDXLrender_v2.0:x>
 
 # HDR сила (0..1)
 HDR_STRENGTH_LOW   = 0.35
 HDR_STRENGTH_MED   = 0.60
 HDR_STRENGTH_HIGH  = 0.85
 
-# Доп. «ручки» внутри HDR (при желании крути эти коэффициенты)
-HDR_EXPOSURE_BASE  = 1.06   # глобальная экспозиция (1.00..1.40)
-HDR_EXPOSURE_GAIN  = 0.30   # вклад от strength в экспозицию
-HDR_LOG_A_BASE     = 2.0    # параметр лог-томапа (2..6)
+# Доп. «ручки» внутри HDR
+HDR_EXPOSURE_BASE  = 1.06                        # глобальная экспозиция (1.00..1.40)
+HDR_EXPOSURE_GAIN  = 0.30                        # вклад от strength в экспозицию
+HDR_LOG_A_BASE     = 2.0                         # параметр лог-томапа (2..6)
 HDR_LOG_A_GAIN     = 3.0
 
 # ESRGAN
-UPSCALE_AFTER_HDR  = True   # финализировать ESRGAN
-UPSCALE_SCALE      = 2      # 2 или 4
+UPSCALE_AFTER_HDR        = True                  # финализировать ESRGAN
+UPSCALE_SCALE            = 2                     # 2 или 4
+ESRGAN_MAX_INPUT_PIXELS  = 2_000_000             # безопасный лимит входа для ESRGAN
 
 # ---------- STATE ----------
 # user_id -> {'effect': ..., 'strength': float}
@@ -125,7 +126,7 @@ def pick_first_url(output) -> str:
     except Exception:
         return str(output)
 
-# ---------- HDR (лог-тонмап, не темнит) ----------
+# ---------- HDR (лог-тонмап, с анти-«серостью») ----------
 def _pil_gaussian(img: Image.Image, radius: float) -> Image.Image:
     small = img.resize((max(8, img.width//2), max(8, img.height//2)), Image.LANCZOS)
     small = small.filter(ImageFilter.GaussianBlur(radius=radius*0.75))
@@ -136,29 +137,32 @@ def hdr_enhance_path(orig_path: str, strength: float = 0.6) -> str:
     Натуральный HDR без «пластика»:
       1) глобальная экспозиция (поднимаем midtones),
       2) лог-тонмап на яркости (компресс хайлайтов, подъём теней),
-      3) локальный контраст мягко, немного насыщенности.
-    Работает светлее/яснее, не уводит в серый.
+      3) локальный контраст мягко, немного насыщенности,
+      4) авто-компенсация яркости, если стало темнее.
     """
     im = Image.open(orig_path).convert("RGB")
     im = ImageOps.exif_transpose(im)
     arr = np.asarray(im).astype(np.float32) / 255.0
 
-    # --- 1) глобальная экспозиция
-    exposure = HDR_EXPOSURE_BASE + HDR_EXPOSURE_GAIN * strength   # ~1.16 при strength=0.35 .. ~1.31 при 0.85
+    # базовая средняя яркость для контроля
+    in_luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    in_mean = float(in_luma.mean())
+
+    # 1) глобальная экспозиция
+    exposure = HDR_EXPOSURE_BASE + HDR_EXPOSURE_GAIN * strength   # ~1.16..1.31
     arr = np.clip(arr * exposure, 0.0, 1.0)
 
-    # --- 2) лог-тонмап по луме с сохранением цвета
+    # 2) лог-тонмап по луме с сохранением цвета
     luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
     a = HDR_LOG_A_BASE + HDR_LOG_A_GAIN * strength                 # 2..5.5
-    denom = np.log1p(a)
-    y_new = np.log1p(a * luma) / (denom + 1e-8)                    # compress highlights, lift shadows
+    y_new = np.log1p(a * luma) / (np.log1p(a) + 1e-8)
     ratio = y_new / np.maximum(luma, 1e-6)
-    for c in range(3):
-        arr[...,c] = np.clip(arr[...,c] * ratio, 0.0, 1.0)
+    arr *= ratio[..., None]
+    arr = np.clip(arr, 0.0, 1.0)
 
     base = Image.fromarray((arr*255).astype(np.uint8))
 
-    # мягкие маски для доп. теней/хайлайтов (микро-подстройка)
+    # мягкие маски для донастройки теней/хайлайтов
     l = np.asarray(base.convert("L")).astype(np.float32) / 255.0
     sh = np.clip(1.0 - l*1.1, 0.0, 1.0)
     hl = np.clip((l - 0.75)*2.0, 0.0, 1.0)
@@ -175,7 +179,7 @@ def hdr_enhance_path(orig_path: str, strength: float = 0.6) -> str:
         arr2[...,c] = np.clip(chan, 0.0, 1.0)
     base = Image.fromarray((arr2*255).astype(np.uint8))
 
-    # --- 3) локальный контраст и насыщенность
+    # локальный контраст + лёгкая насыщенность
     blurred = base.filter(ImageFilter.GaussianBlur(radius=1.3 + 2.8*strength))
     hp = ImageChops.subtract(base, blurred)
     hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(110+100*strength), threshold=3))
@@ -183,19 +187,43 @@ def hdr_enhance_path(orig_path: str, strength: float = 0.6) -> str:
     base = Image.blend(base, hp, mc_amount)
 
     base = base.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80+int(80*strength), threshold=2))
-    sat = 1.06 + 0.16*strength
-    base = ImageEnhance.Color(base).enhance(sat)
+    base = ImageEnhance.Color(base).enhance(1.06 + 0.16*strength)
+
+    # 4) если стало темнее — компенсируем
+    out_l = np.asarray(base.convert("L")).astype(np.float32)/255.0
+    out_mean = float(out_l.mean())
+    if out_mean < in_mean * 0.98:
+        gain = min(1.40, max(1.00, (in_mean / max(out_mean, 1e-6)) ** 0.85))
+        base = ImageEnhance.Brightness(base).enhance(gain)
 
     fd, out_path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     base.save(out_path, "JPEG", quality=95, optimize=True)
     return out_path
 
-# ---------- ESRGAN ----------
+# ---------- ESRGAN (безопасный вход под лимит GPU) ----------
 def esrgan_upscale_path(path: str, scale: int = 2) -> str:
-    with open(path, "rb") as bf:
+    im = Image.open(path).convert("RGB")
+    im = ImageOps.exif_transpose(im)
+    w, h = im.size
+    px = w * h
+    if px > ESRGAN_MAX_INPUT_PIXELS:
+        k = (ESRGAN_MAX_INPUT_PIXELS / px) ** 0.5
+        nw, nh = max(256, int(w * k)), max(256, int(h * k))
+        im = im.resize((nw, nh), Image.LANCZOS)
+        fd, safe_in = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+        im.save(safe_in, "JPEG", quality=95, optimize=True)
+        in_path = safe_in
+    else:
+        in_path = path
+
+    with open(in_path, "rb") as bf:
         out = replicate.run(MODEL_ESRGAN, input={"image": bf, "scale": scale})
     url = pick_first_url(out)
     tmp = download_to_temp(url)
+
+    if in_path != path:
+        try: os.remove(in_path)
+        except: pass
     return tmp
 
 # ---------- PIPELINES ----------
@@ -204,7 +232,7 @@ async def run_nature_enhance_clarity_hdr(file_id: str, strength: float) -> str:
     local_in = await download_tg_photo(file_id)
     resize_inplace(local_in, INPUT_MAX_SIDE)
 
-    # 2) Clarity по файлу (а не по URL) — чтобы контролировать размер
+    # 2) Clarity по файлу (контроль размера)
     prompt_text = (
         "masterpiece, best quality, highres,\n"
         f"<lora:more_details:{CLARITY_MORE_DETAILS_LORA}>\n"
