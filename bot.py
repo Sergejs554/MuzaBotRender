@@ -1,14 +1,9 @@
-# bot.py — Nature Inspire (Replicate) — CLARITY + Натуральный HDR (две версии)
+# bot.py — Nature Inspire (Clarity + HDR) и Nature Inspire 2.0 (HDR only) + ESRGAN финализация
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
-from io import BytesIO
-
-# === добавлено ===
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps, ImageEnhance, ImageChops
-# === /добавлено ===
-
 import replicate
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InputFile
@@ -28,11 +23,35 @@ os.environ["REPLICATE_API_TOKEN"] = REPL_TOKEN
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# ---------- MODEL REFS ----------
+# ---------- MODELS ----------
 MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
+MODEL_ESRGAN  = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
+
+# ---------- TUNABLES (крутилки) ----------
+# Clarity
+CLARITY_SCALE_FACTOR     = 2
+CLARITY_DYNAMIC          = 6.0
+CLARITY_CREATIVITY       = 0.25
+CLARITY_RESEMBLANCE      = 0.65
+CLARITY_TILING_W         = 112
+CLARITY_TILING_H         = 144
+CLARITY_STEPS            = 22
+CLARITY_SD_MODEL         = "juggernaut_reborn.safetensors [338b85bc4f]"
+CLARITY_SCHEDULER        = "DPM++ 3M SDE Karras"
+CLARITY_MORE_DETAILS_LORA= 0.5   # <lora:more_details:0.5>
+CLARITY_RENDER_LORA      = 1.0   # <lora:SDXLrender_v2.0:1>
+
+# HDR
+HDR_STRENGTH_LOW   = 0.35
+HDR_STRENGTH_MED   = 0.60
+HDR_STRENGTH_HIGH  = 0.85
+
+# ESRGAN
+UPSCALE_AFTER_HDR  = True     # финализировать ESRGAN
+UPSCALE_SCALE      = 2        # 2 или 4
 
 # ---------- STATE ----------
-# user_id -> {'effect': 'nature_menu'|'nature2_menu'|'nature_clarity_hdr'|'nature_hdr', 'strength': float}
+# user_id -> {'effect': ..., 'strength': float}
 WAIT = {}
 
 # ---------- HELPERS ----------
@@ -44,8 +63,7 @@ async def telegram_file_to_public_url(file_id: str) -> str:
     return tg_public_url(tg_file.file_path)
 
 def download_to_temp(url: str) -> str:
-    fd, path = tempfile.mkstemp(suffix=".png")
-    os.close(fd)
+    fd, path = tempfile.mkstemp(suffix=".png"); os.close(fd)
     urllib.request.urlretrieve(url, path)
     return path
 
@@ -62,8 +80,7 @@ def ensure_photo_size_under_telegram_limit(path: str, max_bytes: int = 10 * 1024
                 try: os.remove(path)
                 except: pass
                 return tmp
-            os.remove(tmp)
-            q -= 8
+            os.remove(tmp); q -= 8
         fd, tmp = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
         img.save(tmp, "JPEG", quality=max(q, 40), optimize=True)
         try: os.remove(path)
@@ -73,10 +90,6 @@ def ensure_photo_size_under_telegram_limit(path: str, max_bytes: int = 10 * 1024
         return path
 
 def pick_first_url(output) -> str:
-    """
-    У clarity-upscaler реплай — чаще список blob-объектов.
-    Возвращаем URL первого элемента. Если пришла строка — её.
-    """
     try:
         if isinstance(output, str):
             return output
@@ -89,82 +102,78 @@ def pick_first_url(output) -> str:
     except Exception:
         return str(output)
 
-# ---------- НАТУРАЛЬНЫЙ HDR (без генерации, без «пластика») ----------
-# === добавлено ===
+# ---------- HDR (натуральный, фикс «темноты») ----------
 def _pil_gaussian(img: Image.Image, radius: float) -> Image.Image:
-    # экономное размытие (down/up + GaussianBlur) для мягких масок
     small = img.resize((max(8, img.width//2), max(8, img.height//2)), Image.LANCZOS)
     small = small.filter(ImageFilter.GaussianBlur(radius=radius*0.75))
     return small.resize(img.size, Image.LANCZOS)
 
 def hdr_enhance_path(orig_path: str, strength: float = 0.6) -> str:
     """
-    Натуральный HDR-тонмаппинг:
-      - поднимаем тени, приглушаем хайлайты (по luma) мягкими масками,
-      - локальный контраст (микро-деталь) без ореолов,
-      - лёгкая насыщенность.
-    strength: 0..1  (0.35 — мягко, 0.6 — средне, 0.85 — агрессивнее)
+    Натуральный HDR-тонмаппинг без «пластика».
+    FIX: добавлен midtone-lift и мягкая экспозиция, чтобы кадр НЕ темнел.
     """
     im = Image.open(orig_path).convert("RGB")
     im = ImageOps.exif_transpose(im)
 
     arr = np.asarray(im).astype(np.float32) / 255.0
-    # luma Rec.709 приблизительно
     luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
 
-    # маски для теней/хайлайтов
-    shadows = np.clip(1.0 - luma*1.2, 0.0, 1.0)
-    highlights = np.clip((luma - 0.65)*1.7, 0.0, 1.0)
+    shadows   = np.clip(1.0 - luma*1.15, 0.0, 1.0)
+    highlights= np.clip((luma - 0.70)*1.5, 0.0, 1.0)
 
-    sh_mask_img = Image.fromarray((shadows*255).astype(np.uint8))
-    hl_mask_img = Image.fromarray((highlights*255).astype(np.uint8))
-    sh_mask_img = _pil_gaussian(sh_mask_img, 3.0)
-    hl_mask_img = _pil_gaussian(hl_mask_img, 3.0)
-    sh_mask = np.asarray(sh_mask_img, dtype=np.float32)/255.0
-    hl_mask = np.asarray(hl_mask_img, dtype=np.float32)/255.0
+    sh_mask = np.asarray(_pil_gaussian(Image.fromarray((shadows*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
+    hl_mask = np.asarray(_pil_gaussian(Image.fromarray((highlights*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
 
-    sh_gain = 0.22 + 0.35*strength   # подъём теней
-    hl_cut  = 0.15 + 0.25*strength   # срез хайлайтов
+    # усилить тени чуть больше, хайлайты резать мягче
+    sh_gain = 0.28 + 0.40*strength
+    hl_cut  = 0.10 + 0.18*strength
 
     for c in range(3):
         chan = arr[...,c]
-        chan = chan + sh_mask * sh_gain * (1.0 - chan)  # приподнять тени
-        chan = chan - hl_mask * hl_cut * chan           # приглушить хайлайты
+        chan = chan + sh_mask * sh_gain * (1.0 - chan)
+        chan = chan - hl_mask * hl_cut * chan
         arr[...,c] = np.clip(chan, 0.0, 1.0)
 
     base = Image.fromarray((arr*255).astype(np.uint8))
 
-    # локальный контраст (высокочастотная составляющая)
-    blurred = base.filter(ImageFilter.GaussianBlur(radius=1.8 + 3.5*strength))
+    # midtone-lift (чтобы не темнело): слегка осветлить средние тона
+    lift = 0.04 + 0.06*strength
+    gray = Image.new("RGB", base.size, (int(lift*255),)*3)
+    base = ImageChops.screen(base, gray)
+
+    # локальный контраст (без ореолов)
+    blurred = base.filter(ImageFilter.GaussianBlur(radius=1.6 + 3.2*strength))
     hp = ImageChops.subtract(base, blurred)
-    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.2, percent=int(120+120*strength), threshold=3))
-    mc_amount = 0.20 + 0.25*strength
+    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(120+110*strength), threshold=3))
+    mc_amount = 0.18 + 0.24*strength
     base = Image.blend(base, hp, mc_amount)
 
-    # лёгкая общая резкость
-    base = base.filter(ImageFilter.UnsharpMask(radius=1.2, percent=100+int(100*strength), threshold=2))
-    # лёгкая насыщенность
-    sat = 1.04 + 0.20*strength
+    # микрорезкость + лёгкая насыщенность
+    base = base.filter(ImageFilter.UnsharpMask(radius=1.1, percent=90+int(90*strength), threshold=2))
+    sat = 1.05 + 0.18*strength
     base = ImageEnhance.Color(base).enhance(sat)
 
     fd, out_path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     base.save(out_path, "JPEG", quality=95, optimize=True)
     return out_path
-# === /добавлено ===
+
+# ---------- ESRGAN ----------
+def esrgan_upscale_path(path: str, scale: int = 2) -> str:
+    with open(path, "rb") as bf:
+        out = replicate.run(MODEL_ESRGAN, input={"image": bf, "scale": scale})
+    url = pick_first_url(out)
+    tmp = download_to_temp(url)
+    return tmp
 
 # ---------- PIPELINES ----------
-# 1) Nature Enhance — Clarity + HDR
-# === добавлено ===
 async def run_nature_enhance_clarity_hdr(file_id: str, strength: float) -> str:
-    """
-    TG URL -> CLARITY (Replicate) -> локальный HDR тонмаппинг -> возвращаем локальный путь к файлу
-    """
     public_url = await telegram_file_to_public_url(file_id)
 
     prompt_text = (
         "masterpiece, best quality, highres,\n"
-        "<lora:more_details:0.5>\n"
-        "<lora:SDXLrender_v2.0:1>"
+        f"<lora:more_details:{CLARITY_MORE_DETAILS_LORA}>\n"
+        f"<lora:SDXLrender_v2.0:{CLARITY_RENDER_LORA}>"
     )
     negative = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
 
@@ -172,15 +181,15 @@ async def run_nature_enhance_clarity_hdr(file_id: str, strength: float) -> str:
         "image": public_url,
         "prompt": prompt_text,
         "negative_prompt": negative,
-        "scale_factor": 2,
-        "dynamic": 6,
-        "creativity": 0.25,
-        "resemblance": 0.65,
-        "tiling_width": 112,
-        "tiling_height": 144,
-        "sd_model": "juggernaut_reborn.safetensors [338b85bc4f]",
-        "scheduler": "DPM++ 3M SDE Karras",
-        "num_inference_steps": 22,
+        "scale_factor": CLARITY_SCALE_FACTOR,
+        "dynamic": CLARITY_DYNAMIC,
+        "creativity": CLARITY_CREATIVITY,
+        "resemblance": CLARITY_RESEMBLANCE,
+        "tiling_width": CLARITY_TILING_W,
+        "tiling_height": CLARITY_TILING_H,
+        "sd_model": CLARITY_SD_MODEL,
+        "scheduler": CLARITY_SCHEDULER,
+        "num_inference_steps": CLARITY_STEPS,
         "seed": 1337,
         "downscaling": False,
         "sharpen": 0,
@@ -189,40 +198,40 @@ async def run_nature_enhance_clarity_hdr(file_id: str, strength: float) -> str:
     }
 
     out = replicate.run(MODEL_CLARITY, input=inputs)
-    cl_url = pick_first_url(out)
-
-    # HDR поверх Clarity-результата
+    cl_url  = pick_first_url(out)
     cl_path = download_to_temp(cl_url)
     try:
         hdr_path = hdr_enhance_path(cl_path, strength=strength)
-        return hdr_path  # локальный файл
+        if UPSCALE_AFTER_HDR:
+            up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
+            try: os.remove(hdr_path)
+            except: pass
+            hdr_path = up_path
+        return hdr_path
     finally:
         try: os.remove(cl_path)
         except: pass
-# === /добавлено ===
 
-# 2) Nature Enhance 2.0 — только HDR (без Clarity)
-# === добавлено ===
 async def run_nature_enhance_hdr_only(file_id: str, strength: float) -> str:
-    """
-    TG URL -> скачиваем исходник -> локальный HDR тонмаппинг -> возвращаем локальный путь к файлу
-    """
     public_url = await telegram_file_to_public_url(file_id)
     src_path = download_to_temp(public_url)
     try:
         hdr_path = hdr_enhance_path(src_path, strength=strength)
+        if UPSCALE_AFTER_HDR:
+            up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
+            try: os.remove(hdr_path)
+            except: pass
+            hdr_path = up_path
         return hdr_path
     finally:
         try: os.remove(src_path)
         except: pass
-# === /добавлено ===
 
 # ---------- UI ----------
-# === изменено: новое меню с двумя режимами и выбором силы ===
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("🌿 Nature Enhance (Clarity + HDR)")],
-        [KeyboardButton("🌿 Nature Enhance 2.0 (HDR)")],
+        [KeyboardButton("🌿 Nature Enhance 2.0 (HDR only)")],
     ],
     resize_keyboard=True
 )
@@ -234,28 +243,24 @@ KB_STRENGTH = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
-# === /изменено ===
 
 @dp.message_handler(commands=["start"])
 async def on_start(m: types.Message):
     await m.answer(
-        "Nature Inspire готово 🌿\n"
-        "Выбери режим и силу эффекта:\n"
-        "• Nature Enhance — Clarity + натуральный HDR\n"
-        "• Nature Enhance 2.0 — только натуральный HDR\n",
+        "Nature Inspire 🌿\n"
+        "• Nature Enhance — Clarity + натуральный HDR (+ESRGAN финал)\n"
+        "• Nature Enhance 2.0 — только натуральный HDR (+ESRGAN финал)\n"
+        "Выбери режим и силу эффекта.",
         reply_markup=KB_MAIN
     )
 
 @dp.message_handler(lambda m: m.text in [
     "🌿 Nature Enhance (Clarity + HDR)",
-    "🌿 Nature Enhance 2.0 (HDR)"
+    "🌿 Nature Enhance 2.0 (HDR only)"
 ])
 async def on_choose_mode(m: types.Message):
     uid = m.from_user.id
-    if "Clarity" in m.text:
-        WAIT[uid] = {"effect": "nature_menu"}      # выберем силу, затем ждём фото
-    else:
-        WAIT[uid] = {"effect": "nature2_menu"}     # выберем силу, затем ждём фото
+    WAIT[uid] = {"effect": "clarity_menu" if "Clarity" in m.text else "hdr_menu"}
     await m.answer("Выбери силу эффекта:", reply_markup=KB_STRENGTH)
 
 @dp.message_handler(lambda m: m.text in ["Низкая", "Средняя", "Высокая", "⬅️ Назад"])
@@ -264,44 +269,38 @@ async def on_strength(m: types.Message):
     st = WAIT.get(uid)
     if not st:
         return
-
     if m.text == "⬅️ Назад":
         WAIT.pop(uid, None)
         await m.answer("Главное меню.", reply_markup=KB_MAIN)
         return
 
-    # силу переведём в 0..1
-    strength = 0.6
-    if m.text == "Низкая":  strength = 0.35
-    if m.text == "Средняя": strength = 0.6
-    if m.text == "Высокая": strength = 0.85
+    strength = HDR_STRENGTH_MED
+    if m.text == "Низкая":  strength = HDR_STRENGTH_LOW
+    if m.text == "Высокая": strength = HDR_STRENGTH_HIGH
 
-    if st["effect"] == "nature_menu":
-        WAIT[uid] = {"effect": "nature_clarity_hdr", "strength": strength}
+    if st["effect"] == "clarity_menu":
+        WAIT[uid] = {"effect": "clarity_hdr", "strength": strength}
         await m.answer("Пришли фото — сделаю Nature Enhance (Clarity + HDR) 🌿", reply_markup=KB_MAIN)
-    elif st["effect"] == "nature2_menu":
-        WAIT[uid] = {"effect": "nature_hdr", "strength": strength}
-        await m.answer("Пришли фото — сделаю Nature Enhance 2.0 (HDR) 🌿", reply_markup=KB_MAIN)
+    elif st["effect"] == "hdr_menu":
+        WAIT[uid] = {"effect": "hdr_only", "strength": strength}
+        await m.answer("Пришли фото — сделаю Nature Enhance 2.0 (HDR only) 🌿", reply_markup=KB_MAIN)
 
 @dp.message_handler(content_types=["photo"])
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     st = WAIT.get(uid)
-    if not st or st.get("effect") not in ["nature_clarity_hdr", "nature_hdr"]:
+    if not st or st.get("effect") not in ["clarity_hdr", "hdr_only"]:
         await m.reply("Сначала выбери режим и силу эффекта ⬇️", reply_markup=KB_MAIN)
         return
 
     await m.reply("⏳ Обрабатываю...")
     try:
-        effect = st["effect"]
-        strength = float(st.get("strength", 0.6))
-
-        if effect == "nature_clarity_hdr":
+        strength = float(st.get("strength", HDR_STRENGTH_MED))
+        if st["effect"] == "clarity_hdr":
             out_path = await run_nature_enhance_clarity_hdr(m.photo[-1].file_id, strength=strength)
         else:
             out_path = await run_nature_enhance_hdr_only(m.photo[-1].file_id, strength=strength)
 
-        # отправляем локальный файл как фото
         safe_path = ensure_photo_size_under_telegram_limit(out_path)
         await m.reply_photo(InputFile(safe_path))
         try:
