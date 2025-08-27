@@ -1,4 +1,4 @@
-# bot.py — Nature Inspire: Clarity-only (2.0) и WOW Enhance (топ-пайплайн с крутилкой)
+# bot.py — Nature Inspire: Clarity-only (2.0) и WOW Enhance (топ-пайплайн + крутилка)
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
@@ -28,10 +28,10 @@ dp = Dispatcher(bot)
 MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
 
 # ---------- TUNABLES ----------
-INPUT_MAX_SIDE       = 1536                 # ресайз перед моделями Replicate
+INPUT_MAX_SIDE       = 1536                 # ресайз входа перед моделями Replicate
 FINAL_TELEGRAM_LIMIT = 10 * 1024 * 1024     # 10MB
 
-# Clarity (твои бережные настройки)
+# Clarity (бережные, как в твоих исходниках)
 CL_SCALE_FACTOR      = 2
 CL_DYNAMIC           = 6.0
 CL_CREATIVITY        = 0.25
@@ -45,29 +45,29 @@ CL_LORA_MORE_DETAILS = 0.50
 CL_LORA_RENDER       = 1.00
 CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
 
-# WOW — уровни силы (кнопки: Низкая/Средняя/Высокая)
+# WOW — уровни силы (кнопки)
 WOW_LEVEL_LOW    = 0.60
 WOW_LEVEL_MED    = 0.80
-WOW_LEVEL_HIGH   = 1.10   # как просил
+WOW_LEVEL_HIGH   = 1.10   # как просил (1.1)
 
 # База «вау»-эффекта (топ-пайплайн). Все множители масштабируются strength.
 WOW_BASE = {
-    # HDR тонмап (лог по луме)
+    # 1) HDR тонмап (лог по луме)
     "log_a":            3.4,    # сила HDR-кривой (мягкая компрессия хайлайтов, подъём теней)
-    # Плёночная S-кривая (глубина)
+    # 2) Плёночная S-кривая (глубина)
     "curve_amount":     0.22,
-    # Vibrance (щадящая насыщенность — больше там, где мало цвета)
+    # 3) Vibrance (щадящая насыщенность: больше там, где мало цвета)
     "vibrance_gain":    0.22,
-    # Глобальные
+    # 4) Глобальные
     "contrast_gain":    0.12,
     "brightness_gain":  0.06,
-    # Microcontrast (high-pass blend)
+    # 5) Microcontrast (high-pass blend)
     "microcontrast":    0.30,   # доля примеси HP
     "hp_blur_base":     1.4,    # базовый радиус blur перед high-pass
-    # Bloom (хайлайты, сияние)
+    # 6) Bloom (хайлайты, сияние)
     "bloom_amount":     0.12,
     "bloom_radius":     2.0,    # базовый радиус
-    # Финальный микрошарп
+    # 7) Финальный микрошарп
     "unsharp_percent":  130,
 }
 
@@ -140,7 +140,7 @@ def pick_first_url(output) -> str:
     except Exception:
         return str(output)
 
-# ---------- WOW PIPELINE (Топ) ----------
+# ---------- WOW PIPELINE (ТОП) ----------
 def _vibrance(arr: np.ndarray, gain: float) -> np.ndarray:
     # Усиливаем низконасыщенные области сильнее, высоко-насыщенные — деликатно
     mx = arr.max(axis=-1, keepdims=True)
@@ -167,18 +167,17 @@ def wow_enhance_path(orig_path: str, strength: float) -> str:
 
     # 1) HDR (лог-тонмап по луме)
     a = max(1.0, WOW_BASE["log_a"] * s)
-    luma = in_luma
-    y = np.log1p(a*luma) / (np.log1p(a) + 1e-8)
-    ratio = y / np.maximum(luma, 1e-6)
+    y  = np.log1p(a*in_luma) / (np.log1p(a) + 1e-8)
+    ratio = y / np.maximum(in_luma, 1e-6)
     arr = np.clip(arr * ratio[...,None], 0.0, 1.0)
 
-    # 2) S-кривая (плёночная глубина)
+    # 2) Плёночная S-кривая
     arr = _s_curve(arr, amt= WOW_BASE["curve_amount"] * s)
 
     # 3) Vibrance
     arr = _vibrance(arr, gain= WOW_BASE["vibrance_gain"] * s)
 
-    # 4) Контраст / Яркость (деликатно)
+    # 4) Контраст / Яркость
     im = Image.fromarray((arr*255).astype(np.uint8))
     im = ImageEnhance.Contrast(im).enhance(1.0 + WOW_BASE["contrast_gain"] * s)
     im = ImageEnhance.Brightness(im).enhance(1.0 + WOW_BASE["brightness_gain"] * s)
