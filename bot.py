@@ -1,4 +1,4 @@
-# bot.py — Nature Inspire (Clarity + HDR) и Nature Inspire 2.0 (HDR only) + ESRGAN финализация
+# bot.py — Nature Inspire (Clarity + HDR) и Nature Inspire 2.0 (HDR only) + ESRGAN
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
@@ -28,6 +28,10 @@ MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208
 MODEL_ESRGAN  = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
 
 # ---------- TUNABLES (крутилки) ----------
+# Общие ограничения
+INPUT_MAX_SIDE        = 1536   # ресайз перед моделями Replicate (fix размера)
+FINAL_TELEGRAM_LIMIT  = 10 * 1024 * 1024  # 10MB
+
 # Clarity
 CLARITY_SCALE_FACTOR     = 2
 CLARITY_DYNAMIC          = 6.0
@@ -38,17 +42,23 @@ CLARITY_TILING_H         = 144
 CLARITY_STEPS            = 22
 CLARITY_SD_MODEL         = "juggernaut_reborn.safetensors [338b85bc4f]"
 CLARITY_SCHEDULER        = "DPM++ 3M SDE Karras"
-CLARITY_MORE_DETAILS_LORA= 0.5   # <lora:more_details:0.5>
-CLARITY_RENDER_LORA      = 1.0   # <lora:SDXLrender_v2.0:1>
+CLARITY_MORE_DETAILS_LORA= 0.5   # <lora:more_details:x>
+CLARITY_RENDER_LORA      = 1.0   # <lora:SDXLrender_v2.0:x>
 
-# HDR
+# HDR сила (0..1)
 HDR_STRENGTH_LOW   = 0.35
 HDR_STRENGTH_MED   = 0.60
 HDR_STRENGTH_HIGH  = 0.85
 
+# Доп. «ручки» внутри HDR (при желании крути эти коэффициенты)
+HDR_EXPOSURE_BASE  = 1.06   # глобальная экспозиция (1.00..1.40)
+HDR_EXPOSURE_GAIN  = 0.30   # вклад от strength в экспозицию
+HDR_LOG_A_BASE     = 2.0    # параметр лог-томапа (2..6)
+HDR_LOG_A_GAIN     = 3.0
+
 # ESRGAN
-UPSCALE_AFTER_HDR  = True     # финализировать ESRGAN
-UPSCALE_SCALE      = 2        # 2 или 4
+UPSCALE_AFTER_HDR  = True   # финализировать ESRGAN
+UPSCALE_SCALE      = 2      # 2 или 4
 
 # ---------- STATE ----------
 # user_id -> {'effect': ..., 'strength': float}
@@ -58,16 +68,29 @@ WAIT = {}
 def tg_public_url(file_path: str) -> str:
     return f"https://api.telegram.org/file/bot{API_TOKEN}/{file_path}"
 
-async def telegram_file_to_public_url(file_id: str) -> str:
+async def download_tg_photo(file_id: str) -> str:
     tg_file = await bot.get_file(file_id)
-    return tg_public_url(tg_file.file_path)
+    url = tg_public_url(tg_file.file_path)
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    urllib.request.urlretrieve(url, path)
+    return path
+
+def resize_inplace(path: str, max_side: int):
+    try:
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        if max(img.size) > max_side:
+            img.thumbnail((max_side, max_side), Image.LANCZOS)
+        img.save(path, "JPEG", quality=95, optimize=True)
+    except Exception:
+        pass
 
 def download_to_temp(url: str) -> str:
     fd, path = tempfile.mkstemp(suffix=".png"); os.close(fd)
     urllib.request.urlretrieve(url, path)
     return path
 
-def ensure_photo_size_under_telegram_limit(path: str, max_bytes: int = 10 * 1024 * 1024) -> str:
+def ensure_size_under_telegram_limit(path: str, max_bytes: int = FINAL_TELEGRAM_LIMIT) -> str:
     try:
         if os.path.getsize(path) <= max_bytes:
             return path
@@ -102,7 +125,7 @@ def pick_first_url(output) -> str:
     except Exception:
         return str(output)
 
-# ---------- HDR (натуральный, фикс «темноты») ----------
+# ---------- HDR (лог-тонмап, не темнит) ----------
 def _pil_gaussian(img: Image.Image, radius: float) -> Image.Image:
     small = img.resize((max(8, img.width//2), max(8, img.height//2)), Image.LANCZOS)
     small = small.filter(ImageFilter.GaussianBlur(radius=radius*0.75))
@@ -110,48 +133,57 @@ def _pil_gaussian(img: Image.Image, radius: float) -> Image.Image:
 
 def hdr_enhance_path(orig_path: str, strength: float = 0.6) -> str:
     """
-    Натуральный HDR-тонмаппинг без «пластика».
-    FIX: добавлен midtone-lift и мягкая экспозиция, чтобы кадр НЕ темнел.
+    Натуральный HDR без «пластика»:
+      1) глобальная экспозиция (поднимаем midtones),
+      2) лог-тонмап на яркости (компресс хайлайтов, подъём теней),
+      3) локальный контраст мягко, немного насыщенности.
+    Работает светлее/яснее, не уводит в серый.
     """
     im = Image.open(orig_path).convert("RGB")
     im = ImageOps.exif_transpose(im)
-
     arr = np.asarray(im).astype(np.float32) / 255.0
+
+    # --- 1) глобальная экспозиция
+    exposure = HDR_EXPOSURE_BASE + HDR_EXPOSURE_GAIN * strength   # ~1.16 при strength=0.35 .. ~1.31 при 0.85
+    arr = np.clip(arr * exposure, 0.0, 1.0)
+
+    # --- 2) лог-тонмап по луме с сохранением цвета
     luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-
-    shadows   = np.clip(1.0 - luma*1.15, 0.0, 1.0)
-    highlights= np.clip((luma - 0.70)*1.5, 0.0, 1.0)
-
-    sh_mask = np.asarray(_pil_gaussian(Image.fromarray((shadows*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
-    hl_mask = np.asarray(_pil_gaussian(Image.fromarray((highlights*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
-
-    # усилить тени чуть больше, хайлайты резать мягче
-    sh_gain = 0.28 + 0.40*strength
-    hl_cut  = 0.10 + 0.18*strength
-
+    a = HDR_LOG_A_BASE + HDR_LOG_A_GAIN * strength                 # 2..5.5
+    denom = np.log1p(a)
+    y_new = np.log1p(a * luma) / (denom + 1e-8)                    # compress highlights, lift shadows
+    ratio = y_new / np.maximum(luma, 1e-6)
     for c in range(3):
-        chan = arr[...,c]
-        chan = chan + sh_mask * sh_gain * (1.0 - chan)
-        chan = chan - hl_mask * hl_cut * chan
-        arr[...,c] = np.clip(chan, 0.0, 1.0)
+        arr[...,c] = np.clip(arr[...,c] * ratio, 0.0, 1.0)
 
     base = Image.fromarray((arr*255).astype(np.uint8))
 
-    # midtone-lift (чтобы не темнело): слегка осветлить средние тона
-    lift = 0.04 + 0.06*strength
-    gray = Image.new("RGB", base.size, (int(lift*255),)*3)
-    base = ImageChops.screen(base, gray)
+    # мягкие маски для доп. теней/хайлайтов (микро-подстройка)
+    l = np.asarray(base.convert("L")).astype(np.float32) / 255.0
+    sh = np.clip(1.0 - l*1.1, 0.0, 1.0)
+    hl = np.clip((l - 0.75)*2.0, 0.0, 1.0)
+    sh_mask = np.asarray(_pil_gaussian(Image.fromarray((sh*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
+    hl_mask = np.asarray(_pil_gaussian(Image.fromarray((hl*255).astype(np.uint8)), 3.0), dtype=np.float32)/255.0
 
-    # локальный контраст (без ореолов)
-    blurred = base.filter(ImageFilter.GaussianBlur(radius=1.6 + 3.2*strength))
+    arr2 = np.asarray(base).astype(np.float32) / 255.0
+    sh_gain = 0.12 + 0.22*strength
+    hl_cut  = 0.06 + 0.12*strength
+    for c in range(3):
+        chan = arr2[...,c]
+        chan = chan + sh_mask * sh_gain * (1.0 - chan)
+        chan = chan - hl_mask * hl_cut * chan
+        arr2[...,c] = np.clip(chan, 0.0, 1.0)
+    base = Image.fromarray((arr2*255).astype(np.uint8))
+
+    # --- 3) локальный контраст и насыщенность
+    blurred = base.filter(ImageFilter.GaussianBlur(radius=1.3 + 2.8*strength))
     hp = ImageChops.subtract(base, blurred)
-    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(120+110*strength), threshold=3))
-    mc_amount = 0.18 + 0.24*strength
+    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(110+100*strength), threshold=3))
+    mc_amount = 0.15 + 0.22*strength
     base = Image.blend(base, hp, mc_amount)
 
-    # микрорезкость + лёгкая насыщенность
-    base = base.filter(ImageFilter.UnsharpMask(radius=1.1, percent=90+int(90*strength), threshold=2))
-    sat = 1.05 + 0.18*strength
+    base = base.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80+int(80*strength), threshold=2))
+    sat = 1.06 + 0.16*strength
     base = ImageEnhance.Color(base).enhance(sat)
 
     fd, out_path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
@@ -168,8 +200,11 @@ def esrgan_upscale_path(path: str, scale: int = 2) -> str:
 
 # ---------- PIPELINES ----------
 async def run_nature_enhance_clarity_hdr(file_id: str, strength: float) -> str:
-    public_url = await telegram_file_to_public_url(file_id)
+    # 1) качаем фото и ресайзим перед Replicate
+    local_in = await download_tg_photo(file_id)
+    resize_inplace(local_in, INPUT_MAX_SIDE)
 
+    # 2) Clarity по файлу (а не по URL) — чтобы контролировать размер
     prompt_text = (
         "masterpiece, best quality, highres,\n"
         f"<lora:more_details:{CLARITY_MORE_DETAILS_LORA}>\n"
@@ -177,55 +212,65 @@ async def run_nature_enhance_clarity_hdr(file_id: str, strength: float) -> str:
     )
     negative = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
 
-    inputs = {
-        "image": public_url,
-        "prompt": prompt_text,
-        "negative_prompt": negative,
-        "scale_factor": CLARITY_SCALE_FACTOR,
-        "dynamic": CLARITY_DYNAMIC,
-        "creativity": CLARITY_CREATIVITY,
-        "resemblance": CLARITY_RESEMBLANCE,
-        "tiling_width": CLARITY_TILING_W,
-        "tiling_height": CLARITY_TILING_H,
-        "sd_model": CLARITY_SD_MODEL,
-        "scheduler": CLARITY_SCHEDULER,
-        "num_inference_steps": CLARITY_STEPS,
-        "seed": 1337,
-        "downscaling": False,
-        "sharpen": 0,
-        "handfix": "disabled",
-        "output_format": "png",
-    }
+    with open(local_in, "rb") as f:
+        cl_out = replicate.run(
+            MODEL_CLARITY,
+            input={
+                "image": f,
+                "prompt": prompt_text,
+                "negative_prompt": negative,
+                "scale_factor": CLARITY_SCALE_FACTOR,
+                "dynamic": CLARITY_DYNAMIC,
+                "creativity": CLARITY_CREATIVITY,
+                "resemblance": CLARITY_RESEMBLANCE,
+                "tiling_width": CLARITY_TILING_W,
+                "tiling_height": CLARITY_TILING_H,
+                "sd_model": CLARITY_SD_MODEL,
+                "scheduler": CLARITY_SCHEDULER,
+                "num_inference_steps": CLARITY_STEPS,
+                "seed": 1337,
+                "downscaling": False,
+                "sharpen": 0,
+                "handfix": "disabled",
+                "output_format": "png",
+            }
+        )
+    try: os.remove(local_in)
+    except: pass
 
-    out = replicate.run(MODEL_CLARITY, input=inputs)
-    cl_url  = pick_first_url(out)
+    cl_url  = pick_first_url(cl_out)
     cl_path = download_to_temp(cl_url)
+
+    # 3) HDR
     try:
         hdr_path = hdr_enhance_path(cl_path, strength=strength)
-        if UPSCALE_AFTER_HDR:
-            up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
-            try: os.remove(hdr_path)
-            except: pass
-            hdr_path = up_path
-        return hdr_path
     finally:
         try: os.remove(cl_path)
         except: pass
 
-async def run_nature_enhance_hdr_only(file_id: str, strength: float) -> str:
-    public_url = await telegram_file_to_public_url(file_id)
-    src_path = download_to_temp(public_url)
-    try:
-        hdr_path = hdr_enhance_path(src_path, strength=strength)
-        if UPSCALE_AFTER_HDR:
-            up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
-            try: os.remove(hdr_path)
-            except: pass
-            hdr_path = up_path
-        return hdr_path
-    finally:
-        try: os.remove(src_path)
+    # 4) ESRGAN по флажку
+    if UPSCALE_AFTER_HDR:
+        up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
+        try: os.remove(hdr_path)
         except: pass
+        hdr_path = up_path
+
+    return hdr_path
+
+async def run_nature_enhance_hdr_only(file_id: str, strength: float) -> str:
+    local_in = await download_tg_photo(file_id)
+    resize_inplace(local_in, INPUT_MAX_SIDE)
+    hdr_path = hdr_enhance_path(local_in, strength=strength)
+    try: os.remove(local_in)
+    except: pass
+
+    if UPSCALE_AFTER_HDR:
+        up_path = esrgan_upscale_path(hdr_path, scale=UPSCALE_SCALE)
+        try: os.remove(hdr_path)
+        except: pass
+        hdr_path = up_path
+
+    return hdr_path
 
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
@@ -301,7 +346,7 @@ async def on_photo(m: types.Message):
         else:
             out_path = await run_nature_enhance_hdr_only(m.photo[-1].file_id, strength=strength)
 
-        safe_path = ensure_photo_size_under_telegram_limit(out_path)
+        safe_path = ensure_size_under_telegram_limit(out_path)
         await m.reply_photo(InputFile(safe_path))
         try:
             if os.path.exists(out_path): os.remove(out_path)
