@@ -1,4 +1,4 @@
-# bot.py — Nature Inspire (2 кнопки: Nature Enhance / Nature Enhance 2.0)
+# bot.py — Nature Inspire: (2.0) Clarity→Refiner и WOW Enhance (с крутилкой)
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
@@ -26,41 +26,47 @@ dp = Dispatcher(bot)
 # ---------- MODELS ----------
 MODEL_CLARITY  = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
 MODEL_REFINER  = "fermatresearch/magic-image-refiner:507ddf6f977a7e30e46c0daefd30de7d563c72322f9e4cf7cbac52ef0f667b13"
-MODEL_ESRGAN   = "nightmareai/real-esrgan:f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46aa"
-MODEL_SWIN2SR  = "mv-lab/swin2sr:a01b0512004918ca55d02e554914a9eca63909fa83a29ff0f115c78a7045574f"  # fallback
 
 # ---------- TUNABLES ----------
-INPUT_MAX_SIDE           = 1536                  # ресайз перед моделями (stability)
-FINAL_TELEGRAM_LIMIT     = 10 * 1024 * 1024      # 10MB
+INPUT_MAX_SIDE       = 1536                 # ресайз входа перед моделями
+FINAL_TELEGRAM_LIMIT = 10 * 1024 * 1024     # 10MB лимит телеги
 
 # Clarity (бережные настройки)
-CL_SCALE_FACTOR          = 2
-CL_DYNAMIC               = 5.0
-CL_CREATIVITY            = 0.22
-CL_RESEMBLANCE           = 0.72
-CL_TILING_W              = 112
-CL_TILING_H              = 144
-CL_STEPS                 = 20
-CL_SD_MODEL              = "juggernaut_reborn.safetensors [338b85bc4f]"
-CL_SCHEDULER             = "DPM++ 3M SDE Karras"
-CL_LORA_MORE_DETAILS     = 0.45
-CL_LORA_RENDER           = 0.9
+CL_SCALE_FACTOR      = 2
+CL_DYNAMIC           = 5.0
+CL_CREATIVITY        = 0.22
+CL_RESEMBLANCE       = 0.72
+CL_TILING_W          = 112
+CL_TILING_H          = 144
+CL_STEPS             = 20
+CL_SD_MODEL          = "juggernaut_reborn.safetensors [338b85bc4f]"
+CL_SCHEDULER         = "DPM++ 3M SDE Karras"
+CL_LORA_MORE_DETAILS = 0.45
+CL_LORA_RENDER       = 0.90
 
-# Refiner prompt (натуральное усиление, без пластика)
 REFINER_PROMPT = (
     "enhance photo clarity, natural detail, preserve realistic colors, "
-    "no plastic skin, DSLR-like rendering, avoid over-sharpening"
+    "no plastic look, DSLR-like rendering, avoid over-sharpening"
 )
 
-# Upscale
-UPSCALE_AFTER            = False                  # по умолчанию выкл. (чтобы не ловить OOM)
-UPSCALE_ENGINE           = "swin2sr"              # 'esrgan' | 'swin2sr'
-UPSCALE_SCALE            = 2                      # только для ESRGAN
-ESRGAN_MAX_INPUT_PIXELS  = 1_400_000              # агрессивнее лимит для ESRGAN, чтобы избегать OOM
-ESRGAN_RETRIES           = 3
+# WOW — глобальная ручка интенсивности (0.0..1.2)
+WOW_LOW    = 0.60
+WOW_MEDIUM = 0.80
+WOW_HIGH   = 1.00   # текущий «эталонный» вау
+# Внутренние коэффициенты WOW (можешь тонко настраивать)
+WOW_BASE = {
+    "vibrance": 1.18,      # «вибранс» (щадящая насыщенность)
+    "contrast": 1.10,      # глобальный контраст
+    "brightness": 1.06,    # общий свет
+    "log_a": 3.2,          # сила лог-тонмапа (HDR)
+    "bloom": 0.12,         # highlight bloom/halation
+    "microcontrast": 0.28, # доля высоких частот
+    "unsharp_percent": 120 # финальный микрошарп
+}
 
 # ---------- STATE ----------
-WAIT = {}  # user_id -> {'effect': 'ne'|'ne2'}
+# user_id -> {'effect': 'ne2'|'wow_menu'|'wow', 'strength': float}
+WAIT = {}
 
 # ---------- HELPERS ----------
 def tg_public_url(file_path: str) -> str:
@@ -123,98 +129,63 @@ def pick_first_url(output) -> str:
     except Exception:
         return str(output)
 
-# ---------- UPSCALE ENGINES ----------
-def _run_swin2sr(path: str) -> str:
-    with open(path, "rb") as bf:
-        out = replicate.run(MODEL_SWIN2SR, input={"image": bf})
-    url = pick_first_url(out)
-    return download_to_temp(url)
+# ---------- WOW PIPELINE (локальный) ----------
+def _apply_vibrance(img: Image.Image, amount: float) -> Image.Image:
+    # «вибранс»: усиливаем слабонасыщенные пиксели сильнее
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    mx = arr.max(axis=-1, keepdims=True)
+    mn = arr.min(axis=-1, keepdims=True)
+    sat = (mx - mn)
+    w = 1.0 - sat
+    sat_boost = amount ** w  # плавное усиление
+    mean = arr.mean(axis=-1, keepdims=True)
+    arr = mean + (arr - mean) * sat_boost
+    arr = np.clip(arr, 0, 1)
+    return Image.fromarray((arr * 255).astype(np.uint8))
 
-def _run_esrgan_safe(path: str, scale: int = 2,
-                     max_pixels: int = ESRGAN_MAX_INPUT_PIXELS,
-                     retries: int = ESRGAN_RETRIES) -> str:
-    im = Image.open(path).convert("RGB")
-    im = ImageOps.exif_transpose(im)
-
-    def _save_resized(img, tgt_pixels):
-        w, h = img.size
-        px = w * h
-        if px > tgt_pixels:
-            k = (tgt_pixels / px) ** 0.5
-            nw, nh = max(256, int(w * k)), max(256, int(h * k))
-            img = img.resize((nw, nh), Image.LANCZOS)
-        fd, tmp_in = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
-        img.save(tmp_in, "JPEG", quality=95, optimize=True)
-        return tmp_in
-
-    attempt = 0
-    cur_pixels = max_pixels
-    last_tmp = None
-    while attempt <= retries:
-        if last_tmp and os.path.exists(last_tmp):
-            try: os.remove(last_tmp)
-            except: pass
-        tmp_in = _save_resized(im, cur_pixels)
-        last_tmp = tmp_in
-        try:
-            with open(tmp_in, "rb") as bf:
-                out = replicate.run(MODEL_ESRGAN, input={"image": bf, "scale": scale})
-            url = pick_first_url(out)
-            out_path = download_to_temp(url)
-            try: os.remove(tmp_in)
-            except: pass
-            return out_path
-        except Exception as e:
-            msg = str(e).lower()
-            if "out of memory" in msg or "max size" in msg or "fits in gpu memory" in msg:
-                attempt += 1
-                cur_pixels = int(cur_pixels * 0.7)
-                continue
-            break
-
-    # fallback
-    if last_tmp and os.path.exists(last_tmp):
-        try: os.remove(last_tmp)
-        except: pass
-    return _run_swin2sr(path)
-
-def maybe_upscale(path: str) -> str:
-    if not UPSCALE_AFTER:
-        return path
-    if UPSCALE_ENGINE == "esrgan":
-        return _run_esrgan_safe(path, scale=UPSCALE_SCALE)
-    else:
-        return _run_swin2sr(path)
-
-# ---------- PIPELINES ----------
-async def run_nature_enhance_basic(file_id: str) -> str:
+def wow_enhance_path(orig_path: str, effect_strength: float = WOW_HIGH) -> str:
     """
-    Nature Enhance: Magic Image Refiner (натуральное «про-камера» улучшение)
+    WOW: мягкий HDR + vibrance + локальный контраст + лёгкий bloom + шарп.
+    Все коэффициенты масштабируются effect_strength (0.6, 0.8, 1.0).
     """
-    local_in = await download_tg_photo(file_id)
-    resize_inplace(local_in, INPUT_MAX_SIDE)
-    try:
-        with open(local_in, "rb") as f:
-            ref_out = replicate.run(
-                MODEL_REFINER,
-                input={
-                    "image": f,
-                    "prompt": REFINER_PROMPT,
-                }
-            )
-        ref_url = pick_first_url(ref_out)
-        ref_path = download_to_temp(ref_url)
-    finally:
-        try: os.remove(local_in)
-        except: pass
+    s = float(effect_strength)
+    base = Image.open(orig_path).convert("RGB")
+    base = ImageOps.exif_transpose(base)
 
-    # (опц.) апскейл
-    out_path = maybe_upscale(ref_path)
-    if out_path != ref_path:
-        try: os.remove(ref_path)
-        except: pass
+    # === HDR (лог-тонмап) ===
+    arr = np.asarray(base).astype(np.float32)/255.0
+    luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    a = WOW_BASE["log_a"] * s
+    y_new = np.log1p(a * luma) / (np.log1p(a) + 1e-8)
+    ratio = y_new / np.maximum(luma, 1e-6)
+    arr = np.clip(arr * ratio[...,None], 0, 1)
+    im = Image.fromarray((arr*255).astype(np.uint8))
+
+    # === Vibrance / Contrast / Brightness ===
+    im = _apply_vibrance(im, amount= WOW_BASE["vibrance"]**s )
+    im = ImageEnhance.Contrast(im).enhance( 1.0 + (WOW_BASE["contrast"]-1.0)*s )
+    im = ImageEnhance.Brightness(im).enhance( 1.0 + (WOW_BASE["brightness"]-1.0)*s )
+
+    # === Micro-contrast ===
+    blur = im.filter(ImageFilter.GaussianBlur(radius=1.2 + 2.8*s))
+    hp = ImageChops.subtract(im, blur)
+    hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(90+120*s), threshold=3))
+    im = Image.blend(im, hp, min(0.45, WOW_BASE["microcontrast"]*s))
+
+    # === Bloom (хайлайты) — деликатно ===
+    if WOW_BASE["bloom"] > 0:
+        glow_r = 1.5 + 6.0*s
+        glow = im.filter(ImageFilter.GaussianBlur(radius=glow_r))
+        im = Image.blend(im, ImageChops.screen(im, glow), WOW_BASE["bloom"]*s*0.7)
+
+    # === Финальный микрошарп ===
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(WOW_BASE["unsharp_percent"]*s), threshold=2))
+
+    fd, out_path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    im.save(out_path, "JPEG", quality=95, optimize=True)
     return out_path
 
+# ---------- PIPELINES ----------
 async def run_nature_enhance_v2(file_id: str) -> str:
     """
     Nature Enhance 2.0: Clarity (бережно) → Magic Image Refiner
@@ -222,7 +193,7 @@ async def run_nature_enhance_v2(file_id: str) -> str:
     local_in = await download_tg_photo(file_id)
     resize_inplace(local_in, INPUT_MAX_SIDE)
 
-    # 1) Clarity по файлу (контроль размера)
+    # 1) Clarity
     prompt_text = (
         "masterpiece, best quality, highres,\n"
         f"<lora:more_details:{CL_LORA_MORE_DETAILS}>\n"
@@ -259,15 +230,12 @@ async def run_nature_enhance_v2(file_id: str) -> str:
         try: os.remove(local_in)
         except: pass
 
-    # 2) Refiner поверх результата
+    # 2) Refiner
     try:
         with open(cl_path, "rb") as f:
             ref_out = replicate.run(
                 MODEL_REFINER,
-                input={
-                    "image": f,
-                    "prompt": REFINER_PROMPT,
-                }
+                input={"image": f, "prompt": REFINER_PROMPT}
             )
         ref_url = pick_first_url(ref_out)
         ref_path = download_to_temp(ref_url)
@@ -275,18 +243,34 @@ async def run_nature_enhance_v2(file_id: str) -> str:
         try: os.remove(cl_path)
         except: pass
 
-    # (опц.) апскейл
-    out_path = maybe_upscale(ref_path)
-    if out_path != ref_path:
-        try: os.remove(ref_path)
+    return ref_path
+
+async def run_wow(file_id: str, strength: float) -> str:
+    """
+    WOW Enhance локально по оригиналу (без генеративщины).
+    """
+    local_in = await download_tg_photo(file_id)
+    resize_inplace(local_in, INPUT_MAX_SIDE)
+    try:
+        out_path = wow_enhance_path(local_in, effect_strength=strength)
+    finally:
+        try: os.remove(local_in)
         except: pass
     return out_path
 
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("🌿 Nature Enhance")],
         [KeyboardButton("🌿 Nature Enhance 2.0")],
+        [KeyboardButton("🌿 WOW Enhance")],
+    ],
+    resize_keyboard=True
+)
+
+KB_STRENGTH = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton("⬅️ Назад")],
+        [KeyboardButton("Низкая"), KeyboardButton("Средняя"), KeyboardButton("Высокая")],
     ],
     resize_keyboard=True
 )
@@ -295,32 +279,54 @@ KB_MAIN = ReplyKeyboardMarkup(
 async def on_start(m: types.Message):
     await m.answer(
         "Nature Inspire 🌿\n"
-        "• Nature Enhance — Magic Image Refiner (натуральная «про-камера» обработка)\n"
-        "• Nature Enhance 2.0 — Clarity → Magic Image Refiner (бережно, детальнее)\n"
-        "Пришли фото после выбора режима.",
+        "• Nature Enhance 2.0 — Clarity → Refiner (бережная про-камера)\n"
+        "• WOW Enhance — HDR+Vibrance+Depth (с крутилкой силы)\n"
+        "Выбери режим.",
         reply_markup=KB_MAIN
     )
 
-@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance", "🌿 Nature Enhance 2.0"])
+@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance 2.0", "🌿 WOW Enhance"])
 async def on_choose_mode(m: types.Message):
     uid = m.from_user.id
-    WAIT[uid] = {"effect": "ne" if "2.0" not in m.text else "ne2"}
-    await m.answer("Ок! Пришли фото.")
+    if "WOW" in m.text:
+        WAIT[uid] = {"effect": "wow_menu"}
+        await m.answer("Выбери силу эффекта:", reply_markup=KB_STRENGTH)
+    else:
+        WAIT[uid] = {"effect": "ne2"}
+        await m.answer("Пришли фото — сделаю Nature Enhance 2.0 🌿", reply_markup=KB_MAIN)
+
+@dp.message_handler(lambda m: m.text in ["Низкая", "Средняя", "Высокая", "⬅️ Назад"])
+async def on_strength(m: types.Message):
+    uid = m.from_user.id
+    st = WAIT.get(uid)
+    if not st:
+        return
+    if m.text == "⬅️ Назад":
+        WAIT.pop(uid, None)
+        await m.answer("Главное меню.", reply_markup=KB_MAIN)
+        return
+
+    strength = WOW_MEDIUM
+    if m.text == "Низкая":  strength = WOW_LOW
+    if m.text == "Высокая": strength = WOW_HIGH
+
+    WAIT[uid] = {"effect": "wow", "strength": strength}
+    await m.answer("Пришли фото — сделаю WOW Enhance 🌿", reply_markup=KB_MAIN)
 
 @dp.message_handler(content_types=["photo"])
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     st = WAIT.get(uid)
-    if not st or st.get("effect") not in ["ne", "ne2"]:
+    if not st or st.get("effect") not in ["ne2", "wow"]:
         await m.reply("Сначала выбери режим ⬇️", reply_markup=KB_MAIN)
         return
 
     await m.reply("⏳ Обрабатываю...")
     try:
-        if st["effect"] == "ne":
-            out_path = await run_nature_enhance_basic(m.photo[-1].file_id)
-        else:
+        if st["effect"] == "ne2":
             out_path = await run_nature_enhance_v2(m.photo[-1].file_id)
+        else:
+            out_path = await run_wow(m.photo[-1].file_id, strength=float(st.get("strength", WOW_MEDIUM)))
 
         safe = ensure_size_under_telegram_limit(out_path)
         await m.reply_photo(InputFile(safe))
@@ -328,7 +334,6 @@ async def on_photo(m: types.Message):
             if os.path.exists(out_path): os.remove(out_path)
             if safe != out_path and os.path.exists(safe): os.remove(safe)
         except: pass
-
     except Exception:
         tb = traceback.format_exc(limit=20)
         await m.reply(f"🔥 Ошибка Nature Inspire:\n```\n{tb}\n```", parse_mode="Markdown")
