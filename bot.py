@@ -46,9 +46,9 @@ CL_LORA_RENDER       = 1.00
 CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
 
 # WOW — уровни силы на кнопках
-WOW_LEVEL_LOW    = 0.60
-WOW_LEVEL_MED    = 0.80
-WOW_LEVEL_HIGH   = 1.10
+WOW_LEVEL_LOW    = 1
+WOW_LEVEL_MED    = 1.5
+WOW_LEVEL_HIGH   = 2
 
 # База «вау»-эффекта (эталон). Параметры будут масштабироваться умной крутилкой.
 WOW_BASE = {
