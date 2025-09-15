@@ -1,5 +1,6 @@
 # bot.py — Nature Inspire (фикс микса): HDR-only = Nature Enhance 2.0, WOW = сочный топ-пайплайн
-# env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN
+# + 🎻 Violin Touch
+# env: TELEGRAM_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
 import numpy as np
@@ -25,20 +26,20 @@ UI_LOW, UI_MED, UI_HIGH = 0.85, 1.00, 1.15
 
 # ==== WOW: РАЗДЕЛЬНЫЕ КРУТИЛКИ ==================================================
 # 1) COLOR — насыщенность/вибранс (деликатно поднимает «плоские» цвета)
-COLOR_VIBRANCE_BASE   = 0.36   # ↑ цвет
-COLOR_CONTRAST_BASE   = 0.12   # ↑ общ. контраст
-COLOR_BRIGHT_BASE     = 0.06   # ↑ общ. яркость
+COLOR_VIBRANCE_BASE   = 0.36
+COLOR_CONTRAST_BASE   = 0.12
+COLOR_BRIGHT_BASE     = 0.06
 
 # 2) DEPTH — «объём»: S-кривая, микроконтраст (high-pass), финальный шарп
-DEPTH_S_CURVE_BASE    = 0.22   # ↑ плёночная S-кривая
-DEPTH_MICROCONTR_BASE = 0.30   # ↑ примесь high-pass
-DEPTH_HP_RADIUS_BASE  = 1.40   # базовый радиус блюра для high-pass
-DEPTH_UNSHARP_BASE    = 130    # % финального микрошарпа
+DEPTH_S_CURVE_BASE    = 0.22
+DEPTH_MICROCONTR_BASE = 0.30
+DEPTH_HP_RADIUS_BASE  = 1.40
+DEPTH_UNSHARP_BASE    = 130
 
 # 3) DRAMA — драматизм: HDR-кривая (лог), bloom хайлайтов
-DRAMA_HDR_LOGA_BASE   = 3.9   # сила лог-тонмапа (компресс хайлайтов, подъём теней)
-DRAMA_BLOOM_AMOUNT    = 0.18   # примесь сияния
-DRAMA_BLOOM_RADIUS    = 2.00   # базовый радиус bloom
+DRAMA_HDR_LOGA_BASE   = 3.9
+DRAMA_BLOOM_AMOUNT    = 0.18
+DRAMA_BLOOM_RADIUS    = 2.00
 
 # Анти-серость (гарантия, что не потемнеет)
 ANTI_GREY_TOL = 0.98
@@ -46,7 +47,8 @@ ANTI_GREY_CAP = 1.35
 # ================================================================================
 
 # ---------- STATE ----------
-WAIT = {}  # user_id -> {'effect': 'ne2' | 'wow_menu' | 'wow', 'ui_gain': float}
+# user_id -> {'effect': 'ne2' | 'wow_menu' | 'wow' | 'violin', 'ui_gain': float}
+WAIT = {}
 
 # ---------- HELPERS ----------
 def resize_inplace(path: str, max_side: int):
@@ -105,14 +107,13 @@ def hdr_only_path(orig_path: str) -> str:
     """Натуральный HDR-only для Nature Enhance 2.0 (без серости)."""
     im = Image.open(orig_path).convert("RGB")
     im = ImageOps.exif_transpose(im)
-    a = 3.0  # мягко; можно поджать/усилить
+    a = 3.0
     arr = np.asarray(im).astype(np.float32)/255.0
     luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
     y    = np.log1p(a*luma) / (np.log1p(a)+1e-8)
     ratio = y / np.maximum(luma, 1e-6)
     arr = np.clip(arr * ratio[...,None], 0.0, 1.0)
 
-    # лёгкая компенсация серости + деликатный контраст
     out = Image.fromarray((arr*255).astype(np.uint8))
     out = ImageEnhance.Brightness(out).enhance(1.04)
     out = ImageEnhance.Contrast(out).enhance(1.06)
@@ -123,13 +124,11 @@ def hdr_only_path(orig_path: str) -> str:
 
 def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     """
-    WOW-пайплайн: тот самый сочный топ.
-    ui_gain — только мягкий множитель кнопки (0.85 / 1.00 / 1.15).
-    Основной «характер» задают COLOR/DEPTH/DRAMA крутилки выше.
+    WOW-пайплайн: сочный топ.
+    ui_gain — мягкий множитель кнопки (0.85 / 1.00 / 1.15).
     """
     g = float(ui_gain)
 
-    # ---- исходник
     base = Image.open(orig_path).convert("RGB")
     base = ImageOps.exif_transpose(base)
     arr  = np.asarray(base).astype(np.float32)/255.0
@@ -138,36 +137,36 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     in_luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
     in_mean = float(in_luma.mean())
 
-    # ---- DRAMA: HDR (лог по луме)
+    # DRAMA: HDR (лог по луме)
     A = DRAMA_HDR_LOGA_BASE * g
     y = np.log1p(A*in_luma) / (np.log1p(A)+1e-8)
     ratio = y / np.maximum(in_luma, 1e-6)
     arr = np.clip(arr * ratio[...,None], 0.0, 1.0)
 
-    # ---- DEPTH: S-curve
+    # DEPTH: S-curve
     arr = _s_curve(arr, amt= DEPTH_S_CURVE_BASE * g)
 
-    # ---- COLOR: Vibrance
+    # COLOR: Vibrance
     arr = _vibrance(arr, gain= COLOR_VIBRANCE_BASE * g)
 
-    # ---- COLOR глобальные
+    # COLOR глобальные
     im = Image.fromarray((arr*255).astype(np.uint8))
     im = ImageEnhance.Contrast(im).enhance(1.0 + COLOR_CONTRAST_BASE * g)
     im = ImageEnhance.Brightness(im).enhance(1.0 + COLOR_BRIGHT_BASE  * g)
 
-    # ---- DEPTH: Microcontrast (high-pass)
+    # DEPTH: Microcontrast (high-pass)
     hp_r = DEPTH_HP_RADIUS_BASE * g
     blurred = im.filter(ImageFilter.GaussianBlur(radius=hp_r))
     hp = ImageChops.subtract(im, blurred)
     hp = hp.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(90 + 110*g), threshold=3))
     im = Image.blend(im, hp, min(0.6, DEPTH_MICROCONTR_BASE * g))
 
-    # ---- DRAMA: Bloom хайлайтов
+    # DRAMA: Bloom хайлайтов
     if DRAMA_BLOOM_AMOUNT > 0:
         glow = im.filter(ImageFilter.GaussianBlur(radius=DRAMA_BLOOM_RADIUS + 4.0*g))
         im = Image.blend(im, ImageChops.screen(im, glow), DRAMA_BLOOM_AMOUNT * g)
 
-    # ---- DEPTH: финальный микрошарп
+    # DEPTH: финальный микрошарп
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(DEPTH_UNSHARP_BASE * g), threshold=2))
 
     # анти-серость
@@ -180,11 +179,63 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
 
+def violin_touch_path(orig_path: str) -> str:
+    """
+    🎻 Violin Touch — «музыкальный» цвет/объём для пейзажей и портретов:
+    - мягкий лог-HDR (как в NE2, но чуть сильнее)
+    - плёночная S-кривая
+    - вибранс с защитой кожи
+    - локальный контраст + лёгкий bloom
+    - финальный микрошарп
+    Без внешних моделей; только PIL/NumPy.
+    """
+    base = Image.open(orig_path).convert("RGB")
+    base = ImageOps.exif_transpose(base)
+    arr  = np.asarray(base).astype(np.float32)/255.0
+
+    # 1) HDR-лог мягче WOW
+    l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    A = 3.6
+    y = np.log1p(A*l) / (np.log1p(A)+1e-8)
+    arr = np.clip(arr * (y/np.maximum(l,1e-6))[...,None], 0, 1)
+
+    # 2) S-curve
+    arr = _s_curve(arr, amt=0.20)
+
+    # 3) Vibrance с защитой кожи (тон кожи ~ [15..35]° в HSV)
+    im_hsv = Image.fromarray((arr*255).astype(np.uint8)).convert("HSV")
+    hsv    = np.asarray(im_hsv).astype(np.float32)
+    H,S,V  = hsv[...,0], hsv[...,1], hsv[...,2]
+    # маска кожи
+    skin = (((H>=15) & (H<=35)) & (S>20) & (V>40)).astype(np.float32)
+    vib_gain = 0.32
+    vib = _vibrance(arr, vib_gain)
+    arr = arr*(skin[...,None]) + vib*(1.0-skin[...,None])
+    arr = np.clip(arr, 0, 1)
+
+    im = Image.fromarray((arr*255).astype(np.uint8))
+
+    # 4) локальный контраст (high-pass) + лёгкий bloom
+    hp = ImageChops.subtract(im, im.filter(ImageFilter.GaussianBlur(radius=1.2)))
+    im = Image.blend(im, hp, 0.28)
+    glow = im.filter(ImageFilter.GaussianBlur(radius=2.4))
+    im = Image.blend(im, ImageChops.screen(im, glow), 0.10)
+
+    # 5) общие правки
+    im = ImageEnhance.Contrast(im).enhance(1.10)
+    im = ImageEnhance.Brightness(im).enhance(1.03)
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
+
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    im.save(path, "JPEG", quality=95, optimize=True)
+    return path
+
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("🌿 Nature Enhance 2.0 (HDR)")],
-        [KeyboardButton("🌿 WOW Enhance")],
+        [KeyboardButton("🌿 WOW Enhance (в разработке)")],
+        [KeyboardButton("🎻 Violin Touch")],
     ],
     resize_keyboard=True
 )
@@ -200,17 +251,21 @@ async def on_start(m: types.Message):
     await m.answer(
         "Nature Inspire 🌿\n"
         "• Nature Enhance 2.0 — HDR-only (мягкий, без серости)\n"
-        "• WOW Enhance — сочный топ-пайплайн (цвет/глубина/драма)\n"
+        "• WOW Enhance — сочный топ-пайплайн (в разработке)\n"
+        "• 🎻 Violin Touch — музыкальный цвет/объём\n"
         "Выбери режим.",
         reply_markup=KB_MAIN
     )
 
-@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance 2.0 (HDR)", "🌿 WOW Enhance"])
+@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance 2.0 (HDR)", "🌿 WOW Enhance (в разработке)", "🎻 Violin Touch"])
 async def on_mode(m: types.Message):
     uid = m.from_user.id
     if "WOW" in m.text:
         WAIT[uid] = {"effect": "wow_menu"}
         await m.answer("Выбери силу эффекта:", reply_markup=KB_STRENGTH)
+    elif "Violin" in m.text:
+        WAIT[uid] = {"effect": "violin"}
+        await m.answer("Пришли фото — сделаю 🎻 Violin Touch", reply_markup=KB_MAIN)
     else:
         WAIT[uid] = {"effect": "ne2"}
         await m.answer("Пришли фото — сделаю Nature Enhance 2.0 🌿", reply_markup=KB_MAIN)
@@ -232,16 +287,21 @@ async def on_strength(m: types.Message):
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     st  = WAIT.get(uid)
-    if not st or st.get("effect") not in ["ne2", "wow"]:
+    if not st or st.get("effect") not in ["ne2", "wow", "violin"]:
         await m.reply("Сначала выбери режим ⬇️", reply_markup=KB_MAIN); return
 
     await m.reply("⏳ Обрабатываю...")
     try:
         local = await download_tg_photo(m.photo[-1].file_id)
-        if st["effect"] == "ne2":
+
+        eff = st["effect"]
+        if eff == "ne2":
             out = hdr_only_path(local)
+        elif eff == "violin":
+            out = violin_touch_path(local)
         else:
             out = wow_enhance_path(local, ui_gain=float(st.get("ui_gain", UI_MED)))
+
         safe = ensure_size_under_telegram_limit(out)
         await m.reply_photo(InputFile(safe))
         try:
