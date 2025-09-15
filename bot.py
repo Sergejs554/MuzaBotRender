@@ -22,7 +22,7 @@ INPUT_MAX_SIDE       = 1536
 FINAL_TELEGRAM_LIMIT = 10 * 1024 * 1024
 
 # UI уровни (мягкий множитель для всех компонент; сами компоненты крутятся отдельно ниже)
-UI_LOW, UI_MED, UI_HIGH = 0.85, 1.00, 1.15
+UI_LOW, UI_MED, UI_HIGH = 0.85, 1.00, 2.00
 
 # ==== WOW: РАЗДЕЛЬНЫЕ КРУТИЛКИ ==================================================
 # 1) COLOR — насыщенность/вибранс (деликатно поднимает «плоские» цвета)
@@ -37,8 +37,8 @@ DEPTH_HP_RADIUS_BASE  = 1.40
 DEPTH_UNSHARP_BASE    = 130
 
 # 3) DRAMA — драматизм: HDR-кривая (лог), bloom хайлайтов
-DRAMA_HDR_LOGA_BASE   = 3.9
-DRAMA_BLOOM_AMOUNT    = 0.18
+DRAMA_HDR_LOGA_BASE   = 2
+DRAMA_BLOOM_AMOUNT    = 0.24
 DRAMA_BLOOM_RADIUS    = 2.00
 
 # Анти-серость (гарантия, что не потемнеет)
@@ -115,7 +115,7 @@ def hdr_only_path(orig_path: str) -> str:
     arr = np.clip(arr * ratio[...,None], 0.0, 1.0)
 
     out = Image.fromarray((arr*255).astype(np.uint8))
-    out = ImageEnhance.Brightness(out).enhance(1.04)
+    out = ImageEnhance.Brightness(out).enhance(1.00)
     out = ImageEnhance.Contrast(out).enhance(1.06)
 
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
@@ -190,7 +190,7 @@ def violin_touch_path(orig_path: str) -> str:
 
     # 1) HDR-лог мягче (чтобы не высветлять)
     l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-    A = 3.3  # было 3.6
+    A = 2.5  # было 3.6
     y = np.log1p(A*l) / (np.log1p(A)+1e-8)
     arr = np.clip(arr * (y/np.maximum(l,1e-6))[...,None], 0, 1)
 
@@ -209,7 +209,7 @@ def violin_touch_path(orig_path: str) -> str:
         sat = mx - mn; w = 1.0 - sat; mean = a.mean(axis=-1, keepdims=True)
         return np.clip(mean + (a-mean)*(1.0 + gain*w), 0.0, 1.0)
 
-    vib_gain = 0.42  # было 0.32 — сочнее
+    vib_gain = 0.48  # было 0.32 — сочнее
     vib = _vibrance(arr, vib_gain)
     arr = np.clip(arr*(skin[...,None]) + vib*(1.0-skin[...,None]), 0, 1)
 
@@ -224,7 +224,7 @@ def violin_touch_path(orig_path: str) -> str:
     # 5) Общие правки: цвет/контраст, без осветления
     im = ImageEnhance.Color(im).enhance(1.08)        # лёгкая доп. насыщенность
     im = ImageEnhance.Contrast(im).enhance(1.14)     # побольше «панча»
-    im = ImageEnhance.Brightness(im).enhance(1.00)   # было 1.03
+    im = ImageEnhance.Brightness(im).enhance(0.90)   # было 1.03
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
 
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
