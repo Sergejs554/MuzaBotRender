@@ -26,19 +26,19 @@ UI_LOW, UI_MED, UI_HIGH = 0.01, 0.50, 1.00
 
 # ==== WOW: РАЗДЕЛЬНЫЕ КРУТИЛКИ ==================================================
 # 1) COLOR — насыщенность/вибранс (деликатно поднимает «плоские» цвета)
-COLOR_VIBRANCE_BASE   = 0.36
-COLOR_CONTRAST_BASE   = 0.12
-COLOR_BRIGHT_BASE     = 0.06
+COLOR_VIBRANCE_BASE   = 0.42
+COLOR_CONTRAST_BASE   = 0.1
+COLOR_BRIGHT_BASE     = 0.02
 
 # 2) DEPTH — «объём»: S-кривая, микроконтраст (high-pass), финальный шарп
-DEPTH_S_CURVE_BASE    = 0.22
-DEPTH_MICROCONTR_BASE = 0.30
+DEPTH_S_CURVE_BASE    = 0.28
+DEPTH_MICROCONTR_BASE = 0.2
 DEPTH_HP_RADIUS_BASE  = 1.40
 DEPTH_UNSHARP_BASE    = 130
 
 # 3) DRAMA — драматизм: HDR-кривая (лог), bloom хайлайтов
 DRAMA_HDR_LOGA_BASE   = 2
-DRAMA_BLOOM_AMOUNT    = 0.24
+DRAMA_BLOOM_AMOUNT    = 0.3
 DRAMA_BLOOM_RADIUS    = 2.00
 
 # Анти-серость (гарантия, что не потемнеет)
