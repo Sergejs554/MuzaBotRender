@@ -178,7 +178,80 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
+    
+def violin_touch_path(orig_path: str) -> str:
+    """
+    🎻 Violin Touch — мягкий «музыкальный» цвет/объём без артефактов.
+    Float-пайплайн + лёгкий dither против постеризации.
+    """
+    # --- загрузка в float ---
+    base = Image.open(orig_path).convert("RGB")
+    base = ImageOps.exif_transpose(base)
+    arr  = np.asarray(base).astype(np.float32) / 255.0
 
+    # --- 1) HDR-лог (чуть мягче) ---
+    l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    A = 3.2  # было 3.6
+    y = np.log1p(A*l) / (np.log1p(A) + 1e-8)
+    arr = np.clip(arr * (y/np.maximum(l, 1e-6))[..., None], 0.0, 1.0)
+
+    # --- 2) S-curve (чуть мягче) ---
+    def _s_curve_np(x, amt):
+        return np.clip(x*(1-amt) + (3*x*x - 2*x*x*x)*amt, 0.0, 1.0)
+    arr = _s_curve_np(arr, amt=0.16)  # было 0.20
+
+    # --- 3) Vibrance с защитой кожи (маска по HSV только для маски) ---
+    pil_for_mask = Image.fromarray((arr*255).astype(np.uint8)).convert("HSV")
+    hsv = np.asarray(pil_for_mask).astype(np.float32)
+    H, S, V = hsv[...,0], hsv[...,1], hsv[...,2]
+    skin = (((H>=15) & (H<=35)) & (S>20) & (V>40)).astype(np.float32)
+    # vibrance в float
+    def _vibrance_np(a, gain):
+        mx = a.max(axis=-1, keepdims=True); mn = a.min(axis=-1, keepdims=True)
+        sat = mx - mn; mean = a.mean(axis=-1, keepdims=True)
+        w = 1.0 - sat
+        return np.clip(mean + (a-mean)*(1.0 + gain*w), 0.0, 1.0)
+    vib_gain = 0.24  # было 0.32
+    vib = _vibrance_np(arr, vib_gain)
+    arr = arr*skin[...,None] + vib*(1.0 - skin[...,None])
+
+    # --- 4) Локальный контраст (high-pass) в float + мягкий bloom ---
+    def _gauss(im_arr, r):
+        pil = Image.fromarray((np.clip(im_arr,0,1)*255).astype(np.uint8))
+        blr = pil.filter(ImageFilter.GaussianBlur(radius=r))
+        return np.asarray(blr).astype(np.float32)/255.0
+
+    hp_blur = _gauss(arr, 1.0)                      # было 1.2
+    hp = np.clip(arr - hp_blur, -1.0, 1.0)
+    arr = np.clip(arr + 0.18*hp, 0.0, 1.0)          # было 0.28
+
+    glow = _gauss(arr, 1.8)                         # было 2.4
+    screen = 1.0 - (1.0 - arr)*(1.0 - glow)
+    arr = np.clip(arr*(1-0.08) + screen*0.08, 0.0, 1.0)  # было 0.10
+
+    # --- 5) Общие правки (контраст/яркость) ---
+    arr = np.clip(arr*1.00, 0.0, 1.0)
+    pil = Image.fromarray((arr*255).astype(np.uint8))
+    pil = ImageEnhance.Contrast(pil).enhance(1.06)  # было 1.10
+    pil = ImageEnhance.Brightness(pil).enhance(1.02)  # было 1.03
+
+    # назад в float для финального микрошарпа и dither
+    arr = np.asarray(pil).astype(np.float32)/255.0
+
+    # лёгкий микрошарп в float
+    sh_blur = _gauss(arr, 0.6)
+    arr = np.clip(arr + (arr - sh_blur)*0.15, 0.0, 1.0)
+
+    # --- DITHER: микрошум против «полос/квадратов» ---
+    rng = np.random.default_rng()
+    arr += rng.uniform(-1/255*0.6, 1/255*0.6, size=arr.shape).astype(np.float32)
+    arr = np.clip(arr, 0.0, 1.0)
+
+    # --- сохранение без хрома-сабсемплинга ---
+    out = Image.fromarray((arr*255).astype(np.uint8))
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    out.save(path, "JPEG", quality=95, optimize=True, subsampling=0)
+    return path
 
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
