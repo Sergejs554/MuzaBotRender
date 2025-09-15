@@ -1,5 +1,5 @@
 # bot.py — Nature Inspire (фикс микса): HDR-only = Nature Enhance 2.0, WOW = сочный топ-пайплайн
-# + 🎻 Violin Touch
+# + 🎻 Violin Touch (подправлен под «глубокий» вид неба/воды)
 # env: TELEGRAM_API_TOKEN
 
 import os, logging, tempfile, urllib.request, traceback
@@ -181,50 +181,59 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
 
 def violin_touch_path(orig_path: str) -> str:
     """
-    🎻 Violin Touch — «музыкальный» цвет/объём для пейзажей и портретов:
-    - мягкий лог-HDR (как в NE2, но чуть сильнее)
-    - плёночная S-кривая
-    - вибранс с защитой кожи
-    - локальный контраст + лёгкий bloom
-    - финальный микрошарп
-    Без внешних моделей; только PIL/NumPy.
+    🎻 Violin Touch — «музыкальный» цвет/объём для пейзажей и портретов.
+    Настроено под более глубокое небо/воду (как в эталонном примере).
     """
     base = Image.open(orig_path).convert("RGB")
     base = ImageOps.exif_transpose(base)
     arr  = np.asarray(base).astype(np.float32)/255.0
 
-    # 1) HDR-лог мягче WOW
+    # 1) Мягкий лог-HDR (чуть сильнее NE2, мягче WOW)
     l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
     A = 3.6
     y = np.log1p(A*l) / (np.log1p(A)+1e-8)
     arr = np.clip(arr * (y/np.maximum(l,1e-6))[...,None], 0, 1)
 
-    # 2) S-curve
-    arr = _s_curve(arr, amt=0.20)
+    # 2) Плёночная S-кривая, немного глубже
+    arr = _s_curve(arr, amt=0.24)
 
-    # 3) Vibrance с защитой кожи (тон кожи ~ [15..35]° в HSV)
-    im_hsv = Image.fromarray((arr*255).astype(np.uint8)).convert("HSV")
-    hsv    = np.asarray(im_hsv).astype(np.float32)
-    H,S,V  = hsv[...,0], hsv[...,1], hsv[...,2]
-    # маска кожи
-    skin = (((H>=15) & (H<=35)) & (S>20) & (V>40)).astype(np.float32)
-    vib_gain = 0.32
+    # 3) Vibrance с защитой кожи (тон кожи ~ [15..35]°; шкала PIL H: 0..255 ≈ 0..360°)
+    im8 = Image.fromarray((arr*255).astype(np.uint8))
+    hsv = np.asarray(im8.convert("HSV")).astype(np.float32)
+    H,S,V = hsv[...,0], hsv[...,1], hsv[...,2]
+
+    # маска кожи (в градусах ~15..35 => в PIL H ~ 11..25)
+    skin = (((H>=11) & (H<=25)) & (S>20) & (V>40)).astype(np.float32)
+
+    vib_gain = 0.36
     vib = _vibrance(arr, vib_gain)
-    arr = arr*(skin[...,None]) + vib*(1.0-skin[...,None])
-    arr = np.clip(arr, 0, 1)
+    arr = np.clip(arr*(skin[...,None]) + vib*(1.0-skin[...,None]), 0, 1)
 
+    # 4) Селективный буст «синих»: больше насыщенности и чуть темнее,
+    #    чтобы получить тот самый «глубокий» синий (небо/вода).
+    # Диапазон синего в PIL H примерно 140..200 (≈ 200..280°)
+    im8 = Image.fromarray((arr*255).astype(np.uint8))
+    hsv = np.asarray(im8.convert("HSV")).astype(np.float32)
+    H,S,V = hsv[...,0], hsv[...,1], hsv[...,2]
+
+    blue_mask = (((H>=140) & (H<=200)) & (S>30) & (V>40)).astype(np.float32)
+    # усилить насыщенность и слегка притемнить
+    S = np.clip(S*(1 + 0.30*blue_mask), 0, 255)
+    V = np.clip(V*(1 - 0.08*blue_mask), 0, 255)
+    hsv_boosted = np.stack([H,S,V], axis=-1).astype(np.uint8)
+    arr = np.asarray(Image.fromarray(hsv_boosted, mode="HSV").convert("RGB")).astype(np.float32)/255.0
+
+    # 5) Локальный контраст (high-pass) + лёгкий bloom
     im = Image.fromarray((arr*255).astype(np.uint8))
-
-    # 4) локальный контраст (high-pass) + лёгкий bloom
     hp = ImageChops.subtract(im, im.filter(ImageFilter.GaussianBlur(radius=1.2)))
-    im = Image.blend(im, hp, 0.28)
+    im = Image.blend(im, hp, 0.30)  # чуть больше микроконтраста
     glow = im.filter(ImageFilter.GaussianBlur(radius=2.4))
-    im = Image.blend(im, ImageChops.screen(im, glow), 0.10)
+    im = Image.blend(im, ImageChops.screen(im, glow), 0.08)  # bloom слегка меньше, чтобы не высветлять
 
-    # 5) общие правки
-    im = ImageEnhance.Contrast(im).enhance(1.10)
-    im = ImageEnhance.Brightness(im).enhance(1.03)
-    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
+    # 6) Общие правки: больше контраста, без лишнего осветления
+    im = ImageEnhance.Contrast(im).enhance(1.18)
+    im = ImageEnhance.Brightness(im).enhance(0.99)
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=125, threshold=2))
 
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
@@ -252,7 +261,7 @@ async def on_start(m: types.Message):
         "Nature Inspire 🌿\n"
         "• Nature Enhance 2.0 — HDR-only (мягкий, без серости)\n"
         "• WOW Enhance — сочный топ-пайплайн (в разработке)\n"
-        "• 🎻 Violin Touch — музыкальный цвет/объём\n"
+        "• 🎻 Violin Touch — музыкальный цвет/объём (глубокие синие)\n"
         "Выбери режим.",
         reply_markup=KB_MAIN
     )
