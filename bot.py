@@ -1,6 +1,6 @@
 # bot.py — Nature Inspire (фикс микса): HDR-only = Nature Enhance 2.0, WOW = сочный топ-пайплайн
-# + 🎻 Violin Touch (подправлен под «глубокий» вид неба/воды)
-# env: TELEGRAM_API_TOKEN
+# + 🎻 Violin Touch (твои значения сохранены) + мягкий финальный Clarity для WOW и Violin «Усиление»
+# env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN (опц., для Clarity)
 
 import os, logging, tempfile, urllib.request, traceback
 import numpy as np
@@ -9,11 +9,21 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InputFile
 from aiogram.utils import executor
 
+# --- опц. для Clarity ---
+try:
+    import replicate
+except Exception:
+    replicate = None
+
 logging.basicConfig(level=logging.INFO)
 
 # ---------- TOKENS ----------
 API_TOKEN  = os.getenv("TELEGRAM_API_TOKEN")
 if not API_TOKEN:  raise RuntimeError("TELEGRAM_API_TOKEN missing")
+REPL_TOKEN = os.getenv("REPLICATE_API_TOKEN")  # может быть None
+if REPL_TOKEN and replicate:
+    os.environ["REPLICATE_API_TOKEN"] = REPL_TOKEN
+
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher(bot)
 
@@ -44,10 +54,24 @@ DRAMA_BLOOM_RADIUS    = 2.00
 # Анти-серость (гарантия, что не потемнеет)
 ANTI_GREY_TOL = 0.98
 ANTI_GREY_CAP = 1.35
+
+# --- Clarity (Replicate) ---
+MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
+CL_SCALE_FACTOR      = 2           # апскейл ×2 (мягко)
+CL_DYNAMIC           = 6.0
+CL_CREATIVITY        = 0.20
+CL_RESEMBLANCE       = 0.70
+CL_TILING_W, CL_TILING_H = 112, 144
+CL_STEPS             = 18
+CL_SD_MODEL          = "juggernaut_reborn.safetensors [338b85bc4f]"
+CL_SCHEDULER         = "DPM++ 3M SDE Karras"
+CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
+CL_LORA_MORE_DETAILS = 0.5
+CL_LORA_RENDER       = 1.0
 # ================================================================================
 
 # ---------- STATE ----------
-# user_id -> {'effect': 'ne2' | 'wow_menu' | 'wow' | 'violin', 'ui_gain': float}
+# user_id -> {'effect': 'ne2' | 'wow_menu' | 'wow' | 'violin_menu' | 'violin' | 'violin_boost', 'ui_gain': float}
 WAIT = {}
 
 # ---------- HELPERS ----------
@@ -88,6 +112,22 @@ async def download_tg_photo(file_id: str) -> str:
     urllib.request.urlretrieve(url, path)
     resize_inplace(path, INPUT_MAX_SIDE)
     return path
+
+def download_to_temp(url: str, suffix=".jpg") -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix); os.close(fd)
+    urllib.request.urlretrieve(url, path)
+    return path
+
+def _pick_first_url(x):
+    try:
+        if isinstance(x, str): return x
+        if isinstance(x, (list, tuple)) and x:
+            o0 = x[0]; u = getattr(o0, "url", None)
+            return u() if callable(u) else (u or str(o0))
+        u = getattr(x, "url", None)
+        return u() if callable(u) else (u or str(x))
+    except:
+        return str(x)
 
 # ---------- CORE OPS ----------
 def _vibrance(arr: np.ndarray, gain: float) -> np.ndarray:
@@ -178,11 +218,12 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
-    
+
 def violin_touch_path(orig_path: str) -> str:
     """
     🎻 Violin Touch — «музыкальный» цвет/объём (чуть темнее и сочнее).
     Без внешних моделей; только PIL/NumPy.
+    >>> ВАЖНО: значения оставлены как ты настроил.
     """
     base = Image.open(orig_path).convert("RGB")
     base = ImageOps.exif_transpose(base)
@@ -190,13 +231,12 @@ def violin_touch_path(orig_path: str) -> str:
 
     # 1) HDR-лог мягче (чтобы не высветлять)
     l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-    A = 2.5  # было 3.6
+    A = 2.5
     y = np.log1p(A*l) / (np.log1p(A)+1e-8)
     arr = np.clip(arr * (y/np.maximum(l,1e-6))[...,None], 0, 1)
 
     # 2) Плёночная S-кривая (чуть сильнее для объёма)
-    def _s_curve(x, amt): return np.clip(x*(1-amt) + (3*x*x - 2*x*x*x)*amt, 0.0, 1.0)
-    arr = _s_curve(arr, amt=0.24)  # было 0.20
+    arr = _s_curve(arr, amt=0.24)
 
     # 3) Vibrance с защитой кожи
     im_hsv = Image.fromarray((arr*255).astype(np.uint8)).convert("HSV")
@@ -204,32 +244,74 @@ def violin_touch_path(orig_path: str) -> str:
     H,S,V  = hsv[...,0], hsv[...,1], hsv[...,2]
     skin = (((H>=15) & (H<=35)) & (S>20) & (V>40)).astype(np.float32)
 
-    def _vibrance(a, gain):
+    def _vib(a, gain):
         mx = a.max(axis=-1, keepdims=True); mn = a.min(axis=-1, keepdims=True)
         sat = mx - mn; w = 1.0 - sat; mean = a.mean(axis=-1, keepdims=True)
         return np.clip(mean + (a-mean)*(1.0 + gain*w), 0.0, 1.0)
 
-    vib_gain = 0.48  # было 0.32 — сочнее
-    vib = _vibrance(arr, vib_gain)
+    vib_gain = 0.48
+    vib = _vib(arr, vib_gain)
     arr = np.clip(arr*(skin[...,None]) + vib*(1.0-skin[...,None]), 0, 1)
 
     im = Image.fromarray((arr*255).astype(np.uint8))
 
     # 4) Локальный контраст + лёгкий bloom
     hp = ImageChops.subtract(im, im.filter(ImageFilter.GaussianBlur(radius=1.2)))
-    im = Image.blend(im, hp, 0.32)   # было 0.28
+    im = Image.blend(im, hp, 0.32)
     glow = im.filter(ImageFilter.GaussianBlur(radius=2.0))
-    im = Image.blend(im, ImageChops.screen(im, glow), 0.08)  # было 0.10
+    im = Image.blend(im, ImageChops.screen(im, glow), 0.08)
 
     # 5) Общие правки: цвет/контраст, без осветления
-    im = ImageEnhance.Color(im).enhance(1.08)        # лёгкая доп. насыщенность
-    im = ImageEnhance.Contrast(im).enhance(1.14)     # побольше «панча»
-    im = ImageEnhance.Brightness(im).enhance(0.90)   # было 1.03
+    im = ImageEnhance.Color(im).enhance(1.08)
+    im = ImageEnhance.Contrast(im).enhance(1.14)
+    im = ImageEnhance.Brightness(im).enhance(0.90)
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
 
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
+
+# ---------- CLARITY (мягкий пост-проход) ----------
+def clarity_post_path(local_path: str) -> str:
+    """Нежный Clarity как финальный штрих. Если токена/репликейта нет — вернём исходник."""
+    if not (REPL_TOKEN and replicate):
+        return local_path
+    try:
+        with open(local_path, "rb") as f:
+            out = replicate.run(MODEL_CLARITY, input={
+                "image": f,
+                "prompt": "<lora:more_details:%s>\n<lora:SDXLrender_v2.0:%s>" % (CL_LORA_MORE_DETAILS, CL_LORA_RENDER),
+                "negative_prompt": CL_NEGATIVE,
+                "scale_factor": CL_SCALE_FACTOR,
+                "dynamic": CL_DYNAMIC,
+                "creativity": CL_CREATIVITY,
+                "resemblance": CL_RESEMBLANCE,
+                "tiling_width": CL_TILING_W,
+                "tiling_height": CL_TILING_H,
+                "sd_model": CL_SD_MODEL,
+                "scheduler": CL_SCHEDULER,
+                "num_inference_steps": CL_STEPS,
+                "downscaling": False,
+                "sharpen": 0,
+                "handfix": "disabled",
+                "output_format": "png",
+                "seed": 1337
+            })
+        url = _pick_first_url(out)
+        if not url:  # подстраховка
+            return local_path
+        new_path = download_to_temp(url, ".png")
+        # конверт в jpg (для веса)
+        im = Image.open(new_path).convert("RGB")
+        fd, jpg = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+        im.save(jpg, "JPEG", quality=95, optimize=True)
+        try:
+            os.remove(new_path)
+        except: pass
+        return jpg
+    except Exception:
+        return local_path
+
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
@@ -245,6 +327,12 @@ KB_STRENGTH = ReplyKeyboardMarkup(
         [KeyboardButton("Низкая"), KeyboardButton("Средняя"), KeyboardButton("Высокая")],
     ], resize_keyboard=True
 )
+KB_VIOLIN = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton("⬅️ Назад")],
+        [KeyboardButton("Обычный 🎻"), KeyboardButton("Усиление 🎻")],
+    ], resize_keyboard=True
+)
 
 @dp.message_handler(commands=["start"])
 async def on_start(m: types.Message):
@@ -257,15 +345,22 @@ async def on_start(m: types.Message):
         reply_markup=KB_MAIN
     )
 
-@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance 2.0 (HDR)", "🌿 WOW Enhance (в разработке)", "🎻 Violin Touch"])
+@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance 2.0 (HDR)", "🌿 WOW Enhance (в разработке)", "🎻 Violin Touch", "Обычный 🎻", "Усиление 🎻"])
 async def on_mode(m: types.Message):
     uid = m.from_user.id
-    if "WOW" in m.text:
+    txt = m.text
+    if txt == "🌿 WOW Enhance (в разработке)":
         WAIT[uid] = {"effect": "wow_menu"}
         await m.answer("Выбери силу эффекта:", reply_markup=KB_STRENGTH)
-    elif "Violin" in m.text:
+    elif txt == "🎻 Violin Touch":
+        WAIT[uid] = {"effect": "violin_menu"}
+        await m.answer("Выбери вариант 🎻:", reply_markup=KB_VIOLIN)
+    elif txt == "Обычный 🎻":
         WAIT[uid] = {"effect": "violin"}
         await m.answer("Пришли фото — сделаю 🎻 Violin Touch", reply_markup=KB_MAIN)
+    elif txt == "Усиление 🎻":
+        WAIT[uid] = {"effect": "violin_boost"}
+        await m.answer("Пришли фото — сделаю 🎻 Violin Touch (усиление)", reply_markup=KB_MAIN)
     else:
         WAIT[uid] = {"effect": "ne2"}
         await m.answer("Пришли фото — сделаю Nature Enhance 2.0 🌿", reply_markup=KB_MAIN)
@@ -277,6 +372,8 @@ async def on_strength(m: types.Message):
     if not st: return
     if m.text == "⬅️ Назад":
         WAIT.pop(uid, None); await m.answer("Главное меню.", reply_markup=KB_MAIN); return
+    if st.get("effect") != "wow_menu":  # «Назад» из других меню уже обработали
+        return
     ui_gain = UI_MED
     if m.text == "Низкая":  ui_gain = UI_LOW
     if m.text == "Высокая": ui_gain = UI_HIGH
@@ -287,7 +384,7 @@ async def on_strength(m: types.Message):
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     st  = WAIT.get(uid)
-    if not st or st.get("effect") not in ["ne2", "wow", "violin"]:
+    if not st or st.get("effect") not in ["ne2", "wow", "violin", "violin_boost"]:
         await m.reply("Сначала выбери режим ⬇️", reply_markup=KB_MAIN); return
 
     await m.reply("⏳ Обрабатываю...")
@@ -297,10 +394,23 @@ async def on_photo(m: types.Message):
         eff = st["effect"]
         if eff == "ne2":
             out = hdr_only_path(local)
+
         elif eff == "violin":
             out = violin_touch_path(local)
-        else:
-            out = wow_enhance_path(local, ui_gain=float(st.get("ui_gain", UI_MED)))
+
+        elif eff == "violin_boost":
+            tmp = violin_touch_path(local)
+            out = clarity_post_path(tmp)  # мягкий clarity-штрих
+            try:
+                if tmp != out and os.path.exists(tmp): os.remove(tmp)
+            except: pass
+
+        else:  # wow
+            tmp = wow_enhance_path(local, ui_gain=float(st.get("ui_gain", UI_MED)))
+            out = clarity_post_path(tmp)  # мягкий clarity-штрих
+            try:
+                if tmp != out and os.path.exists(tmp): os.remove(tmp)
+            except: pass
 
         safe = ensure_size_under_telegram_limit(out)
         await m.reply_photo(InputFile(safe))
