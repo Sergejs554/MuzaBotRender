@@ -27,18 +27,18 @@ UI_LOW, UI_MED, UI_HIGH = 0.01, 0.50, 1.00
 # ==== WOW: РАЗДЕЛЬНЫЕ КРУТИЛКИ ==================================================
 # 1) COLOR — насыщенность/вибранс (деликатно поднимает «плоские» цвета)
 COLOR_VIBRANCE_BASE   = 0.42
-COLOR_CONTRAST_BASE   = 0.1
+COLOR_CONTRAST_BASE   = 0.15
 COLOR_BRIGHT_BASE     = 0.02
 
 # 2) DEPTH — «объём»: S-кривая, микроконтраст (high-pass), финальный шарп
-DEPTH_S_CURVE_BASE    = 0.28
+DEPTH_S_CURVE_BASE    = 0.35
 DEPTH_MICROCONTR_BASE = 0.2
 DEPTH_HP_RADIUS_BASE  = 1.40
 DEPTH_UNSHARP_BASE    = 130
 
 # 3) DRAMA — драматизм: HDR-кривая (лог), bloom хайлайтов
-DRAMA_HDR_LOGA_BASE   = 2
-DRAMA_BLOOM_AMOUNT    = 0.3
+DRAMA_HDR_LOGA_BASE   = 3
+DRAMA_BLOOM_AMOUNT    = 0.9
 DRAMA_BLOOM_RADIUS    = 2.00
 
 # Анти-серость (гарантия, что не потемнеет)
@@ -125,7 +125,7 @@ def hdr_only_path(orig_path: str) -> str:
 def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     """
     WOW-пайплайн: сочный топ.
-    ui_gain — мягкий множитель кнопки (0.85 / 1.00 / 1.15).
+    ui_gain — мягкий множитель кнопки (0.1 / 0.50 / 1.00).
     """
     g = float(ui_gain)
 
