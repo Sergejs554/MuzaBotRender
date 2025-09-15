@@ -231,7 +231,7 @@ def violin_touch_path(orig_path: str) -> str:
 
     # 1) HDR-лог мягче (чтобы не высветлять)
     l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-    A = 2.9
+    A = 2.7
     y = np.log1p(A*l) / (np.log1p(A)+1e-8)
     arr = np.clip(arr * (y/np.maximum(l,1e-6))[...,None], 0, 1)
 
