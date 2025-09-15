@@ -259,7 +259,7 @@ def violin_touch_path(orig_path: str) -> str:
     hp = ImageChops.subtract(im, im.filter(ImageFilter.GaussianBlur(radius=1.2)))
     im = Image.blend(im, hp, 0.32)
     glow = im.filter(ImageFilter.GaussianBlur(radius=2.0))
-    im = Image.blend(im, ImageChops.screen(im, glow), 0.06)
+    im = Image.blend(im, ImageChops.screen(im, glow), 0.04)
 
     # 5) Общие правки: цвет/контраст, без осветления
     im = ImageEnhance.Color(im).enhance(1.08)
