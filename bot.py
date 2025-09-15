@@ -178,7 +178,8 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
-    def violin_touch_path(orig_path: str) -> str:
+    
+def violin_touch_path(orig_path: str) -> str:
     """
     🎻 Violin Touch — «музыкальный» цвет/объём (чуть темнее и сочнее).
     Без внешних моделей; только PIL/NumPy.
@@ -229,7 +230,6 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
-
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
