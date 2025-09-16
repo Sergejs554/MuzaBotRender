@@ -70,8 +70,8 @@ CL_STEPS             = 18
 CL_SD_MODEL          = "juggernaut_reborn.safetensors [338b85bc4f]"
 CL_SCHEDULER         = "DPM++ 3M SDE Karras"
 CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
-CL_LORA_MORE_DETAILS = 0.55
-CL_LORA_RENDER       = 1.2
+CL_LORA_MORE_DETAILS = 0.52
+CL_LORA_RENDER       = 1.0
 # ================================================================================
 
 # ---------- STATE ----------
