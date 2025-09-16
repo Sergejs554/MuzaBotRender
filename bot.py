@@ -1,6 +1,6 @@
 # bot.py — Nature Inspire (фикс микса): HDR-only = Nature Enhance 2.0, WOW = сочный топ-пайплайн
-# + 🎻 Violin Touch (твои значения сохранены)
-# Clarity используется ТОЛЬКО в WOW и «Violin Усиление»
+# + 🎻 Violin Touch (остался только «Усиление» и добавлен «Усиление 2»)
+# Clarity используется ТОЛЬКО в WOW, «Violin Усиление» и «Violin Усиление 2»
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN (опц., для Clarity)
 
 import os, logging, tempfile, urllib.request, traceback
@@ -72,7 +72,7 @@ CL_LORA_RENDER       = 1.2
 # ================================================================================
 
 # ---------- STATE ----------
-# user_id -> {'effect': 'ne2' | 'wow_menu' | 'wow' | 'violin_menu' | 'violin' | 'violin_boost', 'ui_gain': float}
+# user_id -> {'effect': 'ne2' | 'wow_menu' | 'wow' | 'violin_menu' | 'violin_boost' | 'violin_boost2', 'ui_gain': float}
 WAIT = {}
 
 # ---------- HELPERS ----------
@@ -311,6 +311,20 @@ def clarity_post_path(local_path: str) -> str:
     except Exception:
         return local_path
 
+# ---------- EXTRA JUICE для «Усиление 2» (≈ +5–10%) ----------
+def violin_plus10_path(in_path: str) -> str:
+    """
+    Пост-штрих для «Усиление 2»: немного сочнее/глубже без смены глобальных констант.
+    """
+    im = Image.open(in_path).convert("RGB")
+    # аккуратные 5–10% по цвету/контрасту и микро-резкости
+    im = ImageEnhance.Color(im).enhance(1.08)
+    im = ImageEnhance.Contrast(im).enhance(1.06)
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=110, threshold=2))
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    im.save(path, "JPEG", quality=95, optimize=True)
+    return path
+
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
@@ -329,7 +343,7 @@ KB_STRENGTH = ReplyKeyboardMarkup(
 KB_VIOLIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("⬅️ Назад")],
-        [KeyboardButton("Обычный 🎻"), KeyboardButton("Усиление 🎻")],
+        [KeyboardButton("Усиление 🎻"), KeyboardButton("Усиление 2 🎻")],
     ], resize_keyboard=True
 )
 
@@ -339,12 +353,12 @@ async def on_start(m: types.Message):
         "Nature Inspire 🌿\n"
         "• Nature Enhance 2.0 — HDR-only (мягкий, без серости)\n"
         "• WOW Enhance — сочный топ-пайплайн (в разработке)\n"
-        "• 🎻 Violin Touch — музыкальный цвет/объём (глубокие синие)\n"
+        "• 🎻 Violin Touch — усиленные варианты\n"
         "Выбери режим.",
         reply_markup=KB_MAIN
     )
 
-@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance 2.0 (HDR)", "🌿 WOW Enhance (в разработке)", "🎻 Violin Touch", "Обычный 🎻", "Усиление 🎻"])
+@dp.message_handler(lambda m: m.text in ["🌿 Nature Enhance 2.0 (HDR)", "🌿 WOW Enhance (в разработке)", "🎻 Violin Touch", "Усиление 🎻", "Усиление 2 🎻"])
 async def on_mode(m: types.Message):
     uid = m.from_user.id
     txt = m.text
@@ -354,12 +368,12 @@ async def on_mode(m: types.Message):
     elif txt == "🎻 Violin Touch":
         WAIT[uid] = {"effect": "violin_menu"}
         await m.answer("Выбери вариант 🎻:", reply_markup=KB_VIOLIN)
-    elif txt == "Обычный 🎻":
-        WAIT[uid] = {"effect": "violin"}
-        await m.answer("Пришли фото — сделаю 🎻 Violin Touch", reply_markup=KB_MAIN)
     elif txt == "Усиление 🎻":
         WAIT[uid] = {"effect": "violin_boost"}
         await m.answer("Пришли фото — сделаю 🎻 Violin Touch (усиление)", reply_markup=KB_MAIN)
+    elif txt == "Усиление 2 🎻":
+        WAIT[uid] = {"effect": "violin_boost2"}
+        await m.answer("Пришли фото — сделаю 🎻 Violin Touch (усиление 2)", reply_markup=KB_MAIN)
     else:
         WAIT[uid] = {"effect": "ne2"}
         await m.answer("Пришли фото — сделаю Nature Enhance 2.0 🌿", reply_markup=KB_MAIN)
@@ -383,7 +397,7 @@ async def on_strength(m: types.Message):
 async def on_photo(m: types.Message):
     uid = m.from_user.id
     st  = WAIT.get(uid)
-    if not st or st.get("effect") not in ["ne2", "wow", "violin", "violin_boost"]:
+    if not st or st.get("effect") not in ["ne2", "wow", "violin_boost", "violin_boost2"]:
         await m.reply("Сначала выбери режим ⬇️", reply_markup=KB_MAIN); return
 
     await m.reply("⏳ Обрабатываю...")
@@ -394,19 +408,26 @@ async def on_photo(m: types.Message):
         if eff == "ne2":
             out = hdr_only_path(local)
 
-        elif eff == "violin":
-            out = violin_touch_path(local)  # БЕЗ Clarity и без анти-флэр патчей
-
         elif eff == "violin_boost":
-            tmp = violin_touch_path(local)
-            out = clarity_post_path(tmp)  # мягкий clarity-штрих ТОЛЬКО здесь
+            tmp1 = violin_touch_path(local)
+            out  = clarity_post_path(tmp1)  # мягкий clarity-штрих
             try:
-                if tmp != out and os.path.exists(tmp): os.remove(tmp)
+                if tmp1 != out and os.path.exists(tmp1): os.remove(tmp1)
+            except: pass
+
+        elif eff == "violin_boost2":
+            # комбинация: Violin -> Clarity -> +10% сочности/глубины
+            tmp1 = violin_touch_path(local)
+            tmp2 = clarity_post_path(tmp1)
+            out  = violin_plus10_path(tmp2)
+            try:
+                for p in [tmp1, tmp2]:
+                    if p != out and os.path.exists(p): os.remove(p)
             except: pass
 
         else:  # wow
             tmp = wow_enhance_path(local, ui_gain=float(st.get("ui_gain", UI_MED)))
-            out = clarity_post_path(tmp)  # мягкий clarity-штрих ТОЛЬКО для WOW
+            out = clarity_post_path(tmp)  # мягкий clarity-штрих
             try:
                 if tmp != out and os.path.exists(tmp): os.remove(tmp)
             except: pass
