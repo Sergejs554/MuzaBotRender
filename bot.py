@@ -129,7 +129,45 @@ def _pick_first_url(x):
         return u() if callable(u) else (u or str(x))
     except:
         return str(x)
+def kill_cyan_sparkles(im_pil, strength=0.75, blue_delta=35, min_v=140, blur_r=2):
+    """
+    Гасит мелкие голубые спекуляры (как на отблеске воды).
+    strength: 0..1 — сила подавления
+    blue_delta: насколько B должен быть выше max(R,G)
+    min_v: минимальная яркость (0..255) — работаем только по хайлайтам
+    blur_r: радиус лёгкого размытия маски (для естественных краёв)
+    """
+    import numpy as np
+    from PIL import ImageFilter, ImageChops, Image
 
+    im = im_pil.convert("RGB")
+    arr = np.asarray(im).astype(np.int16)
+    R, G, B = arr[...,0], arr[...,1], arr[...,2]
+    V = np.maximum(np.maximum(R,G), B)
+
+    # маска «голубых искр»: синяя доминанта + высокая яркость
+    blue_dom = (B - np.maximum(R, G)) >= blue_delta
+    bright   = V >= min_v
+    mask = (blue_dom & bright).astype(np.uint8) * 255  # 0/255
+
+    if mask.max() == 0:
+        return im  # ничего делать не нужно
+
+    # мягчим край маски
+    m = Image.fromarray(mask, mode="L").filter(ImageFilter.GaussianBlur(radius=blur_r))
+
+    # целевой «тёплый нейтрал» для смешивания
+    warm = Image.new("RGB", im.size, (230, 200, 150))
+
+    # 1) сниж. насыщенность на маске
+    desat = ImageEnhance.Color(im).enhance(1.0 - 0.6*strength)
+
+    # 2) тёплое подмешивание (не даём синему «светиться»)
+    mixed = Image.blend(desat, warm, 0.25*strength)
+
+    # 3) применяем только там, где маска
+    out = Image.composite(mixed, im, m)
+    return out
 # ---------- CORE OPS ----------
 def _vibrance(arr: np.ndarray, gain: float) -> np.ndarray:
     mx = arr.max(axis=-1, keepdims=True)
@@ -293,7 +331,8 @@ def violin_touch_path(orig_path: str) -> str:
     im = ImageEnhance.Contrast(im).enhance(1.14)
     im = ImageEnhance.Brightness(im).enhance(1.00)
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
-
+        # убираем голубые спекуляры в хайлайтах (в т.ч. на воде)
+    im = kill_cyan_sparkles(im, strength=0.8)  # 0.8 — как просил, вернуть
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
