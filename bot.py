@@ -1,6 +1,6 @@
 # bot.py — Nature Inspire (фикс микса): HDR-only = Nature Enhance 2.0, WOW = сочный топ-пайплайн
-# + 🎻 Violin Touch (остался только «Усиление» и добавлен «Усиление 2»)
-# Clarity используется ТОЛЬКО в WOW, «Violin Усиление» и «Violin Усиление 2»
+# + 🎻 Violin Touch: оставлено "Усиление 🎻" + добавлено "Усиление 2 🎻"
+# Clarity используется ТОЛЬКО в WOW, "Violin Усиление", "Violin Усиление 2"
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN (опц., для Clarity)
 
 import os, logging, tempfile, urllib.request, traceback
@@ -56,19 +56,38 @@ DRAMA_BLOOM_RADIUS    = 2.00
 ANTI_GREY_TOL = 0.98
 ANTI_GREY_CAP = 1.35
 
-# --- Clarity (Replicate) ---
+# --- Clarity (Replicate) базовая конфигурация (для WOW и Violin Усиление v1) ---
 MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
-CL_SCALE_FACTOR      = 2
-CL_DYNAMIC           = 6.5
-CL_CREATIVITY        = 0.25
-CL_RESEMBLANCE       = 0.6
-CL_TILING_W, CL_TILING_H = 112, 144
-CL_STEPS             = 18
-CL_SD_MODEL          = "juggernaut_reborn.safetensors [338b85bc4f]"
-CL_SCHEDULER         = "DPM++ 3M SDE Karras"
-CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
-CL_LORA_MORE_DETAILS = 0.52
-CL_LORA_RENDER       = 1.2
+CL_BASE = dict(
+    scale_factor = 2,
+    dynamic = 6.5,
+    creativity = 0.25,
+    resemblance = 0.6,
+    tiling_width = 112,
+    tiling_height = 144,
+    num_inference_steps = 18,
+    sd_model = "juggernaut_reborn.safetensors [338b85bc4f]",
+    scheduler = "DPM++ 3M SDE Karras",
+    negative_prompt = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg",
+    lora_more_details = 0.52,
+    lora_render = 1.2,
+)
+
+# --- Clarity для Violin Усиление 2 (чуть сильнее для явной разницы) ---
+CL_V2 = dict(
+    scale_factor = 2,
+    dynamic = 7.0,          # + ~8%
+    creativity = 0.30,      # + ~20%
+    resemblance = 0.58,     # немного свободнее стиля
+    tiling_width = 112,
+    tiling_height = 144,
+    num_inference_steps = 20,  # +2 шага для «плотности»
+    sd_model = "juggernaut_reborn.safetensors [338b85bc4f]",
+    scheduler = "DPM++ 3M SDE Karras",
+    negative_prompt = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg",
+    lora_more_details = 0.58,   # + чуть «детальности»
+    lora_render = 1.30,         # + чуть «жира»
+)
 # ================================================================================
 
 # ---------- STATE ----------
@@ -220,16 +239,8 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
 
-def violin_touch_path(orig_path: str) -> str:
-    """
-    🎻 Violin Touch — «музыкальный» цвет/объём (чуть темнее и сочнее).
-    Без внешних моделей; только PIL/NumPy.
-    >>> ВАЖНО: значения оставлены как ты настроил.
-    """
-    base = Image.open(orig_path).convert("RGB")
-    base = ImageOps.exif_transpose(base)
-    arr  = np.asarray(base).astype(np.float32)/255.0
-
+def violin_touch_base(arr: np.ndarray) -> np.ndarray:
+    """Общий каркас Violin (без финальных PIL-процедур), чтобы делать v1 и v2."""
     # 1) HDR-лог мягче (чтобы не высветлять)
     l = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
     A = 2.7
@@ -254,15 +265,24 @@ def violin_touch_path(orig_path: str) -> str:
     vib = _vib(arr, vib_gain)
     arr = np.clip(arr*(skin[...,None]) + vib*(1.0-skin[...,None]), 0, 1)
 
-    im = Image.fromarray((arr*255).astype(np.uint8))
+    return arr
 
-    # 4) Локальный контраст + лёгкий bloom
+def violin_touch_v1_path(orig_path: str) -> str:
+    """Violin Усиление (как у тебя было)."""
+    base = Image.open(orig_path).convert("RGB")
+    base = ImageOps.exif_transpose(base)
+    arr  = np.asarray(base).astype(np.float32)/255.0
+
+    arr = violin_touch_base(arr)
+    im  = Image.fromarray((arr*255).astype(np.uint8))
+
+    # Локальный контраст + лёгкий bloom
     hp = ImageChops.subtract(im, im.filter(ImageFilter.GaussianBlur(radius=1.2)))
     im = Image.blend(im, hp, 0.32)
     glow = im.filter(ImageFilter.GaussianBlur(radius=2.0))
     im = Image.blend(im, ImageChops.screen(im, glow), 0.04)
 
-    # 5) Общие правки: цвет/контраст, без осветления
+    # Общие правки
     im = ImageEnhance.Color(im).enhance(1.08)
     im = ImageEnhance.Contrast(im).enhance(1.14)
     im = ImageEnhance.Brightness(im).enhance(1.00)
@@ -272,26 +292,52 @@ def violin_touch_path(orig_path: str) -> str:
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
 
+def violin_touch_v2_path(orig_path: str) -> str:
+    """Violin Усиление 2 — на ~10% сочнее/глубже ДО Clarity."""
+    base = Image.open(orig_path).convert("RGB")
+    base = ImageOps.exif_transpose(base)
+    arr  = np.asarray(base).astype(np.float32)/255.0
+
+    arr = violin_touch_base(arr)
+    im  = Image.fromarray((arr*255).astype(np.uint8))
+
+    # Чуть больше локального контраста и bloom
+    hp = ImageChops.subtract(im, im.filter(ImageFilter.GaussianBlur(radius=1.2)))
+    im = Image.blend(im, hp, 0.36)  # было 0.32
+    glow = im.filter(ImageFilter.GaussianBlur(radius=2.0))
+    im = Image.blend(im, ImageChops.screen(im, glow), 0.05)  # было 0.04
+
+    # Чуть больше цвета/панча (без осветления)
+    im = ImageEnhance.Color(im).enhance(1.12)     # было 1.08
+    im = ImageEnhance.Contrast(im).enhance(1.18)  # было 1.14
+    im = ImageEnhance.Brightness(im).enhance(1.00)
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=125, threshold=2))
+
+    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
+    im.save(path, "JPEG", quality=95, optimize=True)
+    return path
+
 # ---------- CLARITY (мягкий пост-проход) ----------
-def clarity_post_path(local_path: str) -> str:
+def clarity_post_path(local_path: str, cfg: dict = None) -> str:
     """Нежный Clarity как финальный штрих. Если токена/репликейта нет — вернём исходник."""
     if not (REPL_TOKEN and replicate):
         return local_path
+    C = (cfg or CL_BASE)
     try:
         with open(local_path, "rb") as f:
             out = replicate.run(MODEL_CLARITY, input={
                 "image": f,
-                "prompt": "<lora:more_details:%s>\n<lora:SDXLrender_v2.0:%s>" % (CL_LORA_MORE_DETAILS, CL_LORA_RENDER),
-                "negative_prompt": CL_NEGATIVE,
-                "scale_factor": CL_SCALE_FACTOR,
-                "dynamic": CL_DYNAMIC,
-                "creativity": CL_CREATIVITY,
-                "resemblance": CL_RESEMBLANCE,
-                "tiling_width": CL_TILING_W,
-                "tiling_height": CL_TILING_H,
-                "sd_model": CL_SD_MODEL,
-                "scheduler": CL_SCHEDULER,
-                "num_inference_steps": CL_STEPS,
+                "prompt": "<lora:more_details:%s>\n<lora:SDXLrender_v2.0:%s>" % (C["lora_more_details"], C["lora_render"]),
+                "negative_prompt": C["negative_prompt"],
+                "scale_factor": C["scale_factor"],
+                "dynamic": C["dynamic"],
+                "creativity": C["creativity"],
+                "resemblance": C["resemblance"],
+                "tiling_width": C["tiling_width"],
+                "tiling_height": C["tiling_height"],
+                "sd_model": C["sd_model"],
+                "scheduler": C["scheduler"],
+                "num_inference_steps": C["num_inference_steps"],
                 "downscaling": False,
                 "sharpen": 0,
                 "handfix": "disabled",
@@ -311,20 +357,6 @@ def clarity_post_path(local_path: str) -> str:
     except Exception:
         return local_path
 
-# ---------- EXTRA JUICE для «Усиление 2» (≈ +5–10%) ----------
-def violin_plus10_path(in_path: str) -> str:
-    """
-    Пост-штрих для «Усиление 2»: немного сочнее/глубже без смены глобальных констант.
-    """
-    im = Image.open(in_path).convert("RGB")
-    # аккуратные 5–10% по цвету/контрасту и микро-резкости
-    im = ImageEnhance.Color(im).enhance(1.08)
-    im = ImageEnhance.Contrast(im).enhance(1.06)
-    im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=110, threshold=2))
-    fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
-    im.save(path, "JPEG", quality=95, optimize=True)
-    return path
-
 # ---------- UI ----------
 KB_MAIN = ReplyKeyboardMarkup(
     keyboard=[
@@ -340,6 +372,7 @@ KB_STRENGTH = ReplyKeyboardMarkup(
         [KeyboardButton("Низкая"), KeyboardButton("Средняя"), KeyboardButton("Высокая")],
     ], resize_keyboard=True
 )
+# В подменю — ТОЛЬКО два усиления
 KB_VIOLIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("⬅️ Назад")],
@@ -353,7 +386,7 @@ async def on_start(m: types.Message):
         "Nature Inspire 🌿\n"
         "• Nature Enhance 2.0 — HDR-only (мягкий, без серости)\n"
         "• WOW Enhance — сочный топ-пайплайн (в разработке)\n"
-        "• 🎻 Violin Touch — усиленные варианты\n"
+        "• 🎻 Violin Touch — подварианты: Усиление и Усиление 2\n"
         "Выбери режим.",
         reply_markup=KB_MAIN
     )
@@ -370,10 +403,10 @@ async def on_mode(m: types.Message):
         await m.answer("Выбери вариант 🎻:", reply_markup=KB_VIOLIN)
     elif txt == "Усиление 🎻":
         WAIT[uid] = {"effect": "violin_boost"}
-        await m.answer("Пришли фото — сделаю 🎻 Violin Touch (усиление)", reply_markup=KB_MAIN)
+        await m.answer("Пришли фото — сделаю 🎻 Violin Усиление", reply_markup=KB_MAIN)
     elif txt == "Усиление 2 🎻":
         WAIT[uid] = {"effect": "violin_boost2"}
-        await m.answer("Пришли фото — сделаю 🎻 Violin Touch (усиление 2)", reply_markup=KB_MAIN)
+        await m.answer("Пришли фото — сделаю 🎻 Violin Усиление 2", reply_markup=KB_MAIN)
     else:
         WAIT[uid] = {"effect": "ne2"}
         await m.answer("Пришли фото — сделаю Nature Enhance 2.0 🌿", reply_markup=KB_MAIN)
@@ -409,25 +442,22 @@ async def on_photo(m: types.Message):
             out = hdr_only_path(local)
 
         elif eff == "violin_boost":
-            tmp1 = violin_touch_path(local)
-            out  = clarity_post_path(tmp1)  # мягкий clarity-штрих
+            tmp = violin_touch_v1_path(local)
+            out = clarity_post_path(tmp, cfg=CL_BASE)  # Clarity v1
             try:
-                if tmp1 != out and os.path.exists(tmp1): os.remove(tmp1)
+                if tmp != out and os.path.exists(tmp): os.remove(tmp)
             except: pass
 
         elif eff == "violin_boost2":
-            # комбинация: Violin -> Clarity -> +10% сочности/глубины
-            tmp1 = violin_touch_path(local)
-            tmp2 = clarity_post_path(tmp1)
-            out  = violin_plus10_path(tmp2)
+            tmp = violin_touch_v2_path(local)          # чуть сочнее ДО clarity
+            out = clarity_post_path(tmp, cfg=CL_V2)    # Clarity v2 (чуть сильнее)
             try:
-                for p in [tmp1, tmp2]:
-                    if p != out and os.path.exists(p): os.remove(p)
+                if tmp != out and os.path.exists(tmp): os.remove(tmp)
             except: pass
 
         else:  # wow
             tmp = wow_enhance_path(local, ui_gain=float(st.get("ui_gain", UI_MED)))
-            out = clarity_post_path(tmp)  # мягкий clarity-штрих
+            out = clarity_post_path(tmp, cfg=CL_BASE)  # WOW на базовом clarity
             try:
                 if tmp != out and os.path.exists(tmp): os.remove(tmp)
             except: pass
