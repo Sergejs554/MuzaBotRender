@@ -62,16 +62,16 @@ ANTI_GREY_CAP = 1.35
 # --- Clarity (Replicate) ---
 MODEL_CLARITY = "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e"
 CL_SCALE_FACTOR      = 2
-CL_DYNAMIC           = 6.0
-CL_CREATIVITY        = 0.20
+CL_DYNAMIC           = 6.5
+CL_CREATIVITY        = 0.25
 CL_RESEMBLANCE       = 0.70
 CL_TILING_W, CL_TILING_H = 112, 144
 CL_STEPS             = 18
 CL_SD_MODEL          = "juggernaut_reborn.safetensors [338b85bc4f]"
 CL_SCHEDULER         = "DPM++ 3M SDE Karras"
 CL_NEGATIVE          = "(worst quality, low quality, normal quality:2) JuggernautNegative-neg"
-CL_LORA_MORE_DETAILS = 0.5
-CL_LORA_RENDER       = 1.0
+CL_LORA_MORE_DETAILS = 0.55
+CL_LORA_RENDER       = 1.2
 # ================================================================================
 
 # ---------- STATE ----------
