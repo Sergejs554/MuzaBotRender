@@ -1,6 +1,6 @@
 # bot.py — Nature Inspire (фикс микса): HDR-only = Nature Enhance 2.0, WOW = сочный топ-пайплайн
 # + 🎻 Violin Touch (твои значения сохранены)
-# + Анти-флэр (точечное подавление голубых бликов) после любого эффекта
+# Clarity используется ТОЛЬКО в WOW и «Violin Усиление»
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN (опц., для Clarity)
 
 import os, logging, tempfile, urllib.request, traceback
@@ -17,9 +17,6 @@ except Exception:
     replicate = None
 
 logging.basicConfig(level=logging.INFO)
-
-# ---------- TOGGLES ----------
-ANTI_FLARE_ON = True   # можно выключить, поставив False
 
 # ---------- TOKENS ----------
 API_TOKEN  = os.getenv("TELEGRAM_API_TOKEN")
@@ -133,40 +130,12 @@ def _pick_first_url(x):
     except:
         return str(x)
 
-def _anti_flare_blue(im_pil, hi_thr=0.82, blue_h1=150, blue_h2=210, desat=0.60, warm=0.02):
-    """
-    Гасит сине-циановые ореолы на очень ярких бликах:
-    - ищем хайлайты по луме,
-    - внутри хайлайтов приглушаем насыщенность только для синего диапазона,
-    - чуть «согреваем» (тёплый tint), чтобы вода/солнце не уходили в холод.
-    """
-    arr = np.asarray(im_pil).astype(np.float32) / 255.0
-    # лума
-    y = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
-    hi = (y >= hi_thr).astype(np.float32)
-
-    # RGB -> HSV
-    hsv = Image.fromarray((arr*255).astype(np.uint8)).convert("HSV")
-    hsv = np.asarray(hsv).astype(np.float32)
-    H, S, V = hsv[...,0], hsv[...,1]/255.0, hsv[...,2]/255.0
-
-    # маска синего в хайлайтах
-    blue = (((H >= blue_h1) & (H <= blue_h2)).astype(np.float32)) * hi
-    if blue.max() > 0:
-        S2 = S*(1.0 - desat*blue)                 # десатурируем только синий в бликах
-        V2 = np.clip(V + warm*blue, 0.0, 1.0)     # лёгкий «тёплый» сдвиг
-        hsv[...,1] = (S2*255.0)
-        hsv[...,2] = (V2*255.0)
-
-    out = Image.fromarray(hsv.astype(np.uint8), mode="HSV").convert("RGB")
-    return out
-
 # ---------- CORE OPS ----------
 def _vibrance(arr: np.ndarray, gain: float) -> np.ndarray:
     mx = arr.max(axis=-1, keepdims=True)
     mn = arr.min(axis=-1, keepdims=True)
     sat = mx - mn
-    w   = 1.0 - sat          # больше буст там, где мало насыщенности
+    w   = 1.0 - sat
     mean = arr.mean(axis=-1, keepdims=True)
     out  = mean + (arr - mean) * (1.0 + gain * w)
     return np.clip(out, 0.0, 1.0)
@@ -293,69 +262,15 @@ def violin_touch_path(orig_path: str) -> str:
     glow = im.filter(ImageFilter.GaussianBlur(radius=2.0))
     im = Image.blend(im, ImageChops.screen(im, glow), 0.04)
 
-    # 4.1) Анти-флэр для сине-циановых бликов
-    im = _anti_flare_blue(im, hi_thr=0.82, blue_h1=150, blue_h2=210, desat=0.60, warm=0.02)
-
     # 5) Общие правки: цвет/контраст, без осветления
     im = ImageEnhance.Color(im).enhance(1.08)
     im = ImageEnhance.Contrast(im).enhance(1.14)
     im = ImageEnhance.Brightness(im).enhance(1.00)
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
+
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
-
-# ---------- АНТИ-ФЛЭР ----------
-def anti_flare_pass(im: Image.Image) -> Image.Image:
-    """
-    Точечно гасит голубые/циановые всполохи в хайлайтах (линз-флэр).
-    Логика: HSV-маска hue∈[170..210]°, sat>60, value>140 (uint8), размытие маски,
-    затем для маски: снижаем S, слегка снижаем V, hue тянем к тёплому (~30°).
-    """
-    if not ANTI_FLARE_ON:
-        return im
-
-    hsv = im.convert("HSV")
-    arr = np.asarray(hsv).astype(np.float32)  # H,S,V ∈ [0..255]
-    H, S, V = arr[...,0], arr[...,1], arr[...,2]
-
-    # маска «циан/синий в хайлайтах»
-    mask = (
-        ((H >= 170) & (H <= 210)) &
-        (S >= 60) &
-        (V >= 140)
-    ).astype(np.uint8)*255
-
-    # размягчить границы
-    m_img = Image.fromarray(mask, mode="L").filter(ImageFilter.GaussianBlur(radius=6))
-    m = np.asarray(m_img).astype(np.float32)/255.0  # [0..1]
-
-    if m.max() < 0.02:  # почти нет синих бликов — выходим
-        return im
-
-    # применить коррекцию по маске
-    warm_hue = 30.0  # тёплый тон
-    S_corr = S * (1.0 - 0.70*m)     # сильная десатурация блика
-    V_corr = V * (1.0 - 0.15*m)     # чуть темнее, чтобы убрать «светлячок»
-    H_corr = H*(1.0 - 0.60*m) + warm_hue*(0.60*m)
-
-    arr[...,0] = np.clip(H_corr, 0, 255)
-    arr[...,1] = np.clip(S_corr, 0, 255)
-    arr[...,2] = np.clip(V_corr, 0, 255)
-
-    out = Image.fromarray(arr.astype(np.uint8), mode="HSV").convert("RGB")
-    return out
-
-def anti_flare_path(in_path: str) -> str:
-    """Открыть -> anti_flare_pass -> сохранить как новый jpg, вернуть путь."""
-    try:
-        im = Image.open(in_path).convert("RGB")
-        out = anti_flare_pass(im)
-        fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
-        out.save(path, "JPEG", quality=95, optimize=True)
-        return path
-    except Exception:
-        return in_path
 
 # ---------- CLARITY (мягкий пост-проход) ----------
 def clarity_post_path(local_path: str) -> str:
@@ -480,34 +395,21 @@ async def on_photo(m: types.Message):
             out = hdr_only_path(local)
 
         elif eff == "violin":
-            out = violin_touch_path(local)
+            out = violin_touch_path(local)  # БЕЗ Clarity и без анти-флэр патчей
 
         elif eff == "violin_boost":
             tmp = violin_touch_path(local)
-            tmp2 = clarity_post_path(tmp)  # мягкий clarity-штрих
-            out  = anti_flare_path(tmp2) if ANTI_FLARE_ON else tmp2
+            out = clarity_post_path(tmp)  # мягкий clarity-штрих ТОЛЬКО здесь
             try:
-                for p in [tmp, tmp2]:
-                    if p != out and os.path.exists(p): os.remove(p)
+                if tmp != out and os.path.exists(tmp): os.remove(tmp)
             except: pass
 
         else:  # wow
             tmp = wow_enhance_path(local, ui_gain=float(st.get("ui_gain", UI_MED)))
-            tmp2 = clarity_post_path(tmp)  # мягкий clarity-штрих
-            out  = anti_flare_path(tmp2) if ANTI_FLARE_ON else tmp2
+            out = clarity_post_path(tmp)  # мягкий clarity-штрих ТОЛЬКО для WOW
             try:
-                for p in [tmp, tmp2]:
-                    if p != out and os.path.exists(p): os.remove(p)
+                if tmp != out and os.path.exists(tmp): os.remove(tmp)
             except: pass
-
-        # анти-флэр для NE2/обычного Violin тоже применим (без Clarity)
-        if eff in ["ne2", "violin"] and ANTI_FLARE_ON:
-            new_out = anti_flare_path(out)
-            if new_out != out:
-                try:
-                    if os.path.exists(out): os.remove(out)
-                except: pass
-                out = new_out
 
         safe = ensure_size_under_telegram_limit(out)
         await m.reply_photo(InputFile(safe))
