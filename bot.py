@@ -1,5 +1,6 @@
 # bot.py — Nature Inspire (фикс микса): HDR-only = Nature Enhance 2.0, WOW = сочный топ-пайплайн
 # + 🎻 Violin Touch (твои значения сохранены) + мягкий финальный Clarity для WOW и Violin «Усиление»
+# + Anti-spark clamp (антибликовый патч)
 # env: TELEGRAM_API_TOKEN, REPLICATE_API_TOKEN (опц., для Clarity)
 
 import os, logging, tempfile, urllib.request, traceback
@@ -48,7 +49,7 @@ DEPTH_UNSHARP_BASE    = 130
 
 # 3) DRAMA — драматизм: HDR-кривая (лог), bloom хайлайтов
 DRAMA_HDR_LOGA_BASE   = 3
-DRAMA_BLOOM_AMOUNT    = 0.9
+DRAMA_BLOOM_AMOUNT    = 0.8   # ← вернул на 0.8 по твоей просьбе
 DRAMA_BLOOM_RADIUS    = 2.00
 
 # Анти-серость (гарантия, что не потемнеет)
@@ -142,6 +143,26 @@ def _vibrance(arr: np.ndarray, gain: float) -> np.ndarray:
 def _s_curve(x: np.ndarray, amt: float) -> np.ndarray:
     return np.clip(x*(1-amt) + (3*x*x - 2*x*x*x)*amt, 0.0, 1.0)
 
+# ---- Anti-spark clamp (убираем «искорки» после bloom / хайпаса)
+def anti_spark(im: Image.Image, thr: float = 0.985, clamp_to: float = 0.94, soften: float = 1.5) -> Image.Image:
+    """
+    thr — порог по луме, что считаем «искрами»,
+    clamp_to — до какой яркости притормаживаем,
+    soften — размытие маски (радиус), чтобы не было резких краёв.
+    """
+    arr = np.asarray(im).astype(np.float32) / 255.0
+    luma = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    mask = (luma > thr).astype(np.float32)
+    if soften > 0:
+        m_img = Image.fromarray((mask*255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=soften))
+        mask = np.asarray(m_img).astype(np.float32) / 255.0
+    target = np.minimum(luma, clamp_to)
+    ratio = np.clip(target / np.maximum(luma, 1e-6), 0.0, 1.0)
+    # смешиваем только на маске ярких точек
+    ratio3 = (1.0 - mask)[...,None] + (mask[...,None] * ratio[...,None])
+    arr = np.clip(arr * ratio3, 0.0, 1.0)
+    return Image.fromarray((arr*255).astype(np.uint8))
+
 # ---------- EFFECTS ----------
 def hdr_only_path(orig_path: str) -> str:
     """Натуральный HDR-only для Nature Enhance 2.0 (без серости)."""
@@ -206,6 +227,9 @@ def wow_enhance_path(orig_path: str, ui_gain: float) -> str:
         glow = im.filter(ImageFilter.GaussianBlur(radius=DRAMA_BLOOM_RADIUS + 4.0*g))
         im = Image.blend(im, ImageChops.screen(im, glow), DRAMA_BLOOM_AMOUNT * g)
 
+    # --- Anti-spark clamp (после bloom, до финального шарпа)
+    im = anti_spark(im, thr=0.985, clamp_to=0.94, soften=1.5)
+
     # DEPTH: финальный микрошарп
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(DEPTH_UNSHARP_BASE * g), threshold=2))
 
@@ -260,6 +284,9 @@ def violin_touch_path(orig_path: str) -> str:
     im = Image.blend(im, hp, 0.32)
     glow = im.filter(ImageFilter.GaussianBlur(radius=2.0))
     im = Image.blend(im, ImageChops.screen(im, glow), 0.04)
+
+    # --- Anti-spark clamp (на случай «искр» на воде/небе)
+    im = anti_spark(im, thr=0.985, clamp_to=0.94, soften=1.5)
 
     # 5) Общие правки: цвет/контраст, без осветления
     im = ImageEnhance.Color(im).enhance(1.08)
