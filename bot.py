@@ -133,6 +133,34 @@ def _pick_first_url(x):
     except:
         return str(x)
 
+def _anti_flare_blue(im_pil, hi_thr=0.82, blue_h1=150, blue_h2=210, desat=0.60, warm=0.02):
+    """
+    Гасит сине-циановые ореолы на очень ярких бликах:
+    - ищем хайлайты по луме,
+    - внутри хайлайтов приглушаем насыщенность только для синего диапазона,
+    - чуть «согреваем» (тёплый tint), чтобы вода/солнце не уходили в холод.
+    """
+    arr = np.asarray(im_pil).astype(np.float32) / 255.0
+    # лума
+    y = 0.2627*arr[...,0] + 0.6780*arr[...,1] + 0.0593*arr[...,2]
+    hi = (y >= hi_thr).astype(np.float32)
+
+    # RGB -> HSV
+    hsv = Image.fromarray((arr*255).astype(np.uint8)).convert("HSV")
+    hsv = np.asarray(hsv).astype(np.float32)
+    H, S, V = hsv[...,0], hsv[...,1]/255.0, hsv[...,2]/255.0
+
+    # маска синего в хайлайтах
+    blue = (((H >= blue_h1) & (H <= blue_h2)).astype(np.float32)) * hi
+    if blue.max() > 0:
+        S2 = S*(1.0 - desat*blue)                 # десатурируем только синий в бликах
+        V2 = np.clip(V + warm*blue, 0.0, 1.0)     # лёгкий «тёплый» сдвиг
+        hsv[...,1] = (S2*255.0)
+        hsv[...,2] = (V2*255.0)
+
+    out = Image.fromarray(hsv.astype(np.uint8), mode="HSV").convert("RGB")
+    return out
+
 # ---------- CORE OPS ----------
 def _vibrance(arr: np.ndarray, gain: float) -> np.ndarray:
     mx = arr.max(axis=-1, keepdims=True)
@@ -265,12 +293,14 @@ def violin_touch_path(orig_path: str) -> str:
     glow = im.filter(ImageFilter.GaussianBlur(radius=2.0))
     im = Image.blend(im, ImageChops.screen(im, glow), 0.04)
 
+    # 4.1) Анти-флэр для сине-циановых бликов
+    im = _anti_flare_blue(im, hi_thr=0.82, blue_h1=150, blue_h2=210, desat=0.60, warm=0.02)
+
     # 5) Общие правки: цвет/контраст, без осветления
     im = ImageEnhance.Color(im).enhance(1.08)
     im = ImageEnhance.Contrast(im).enhance(1.14)
     im = ImageEnhance.Brightness(im).enhance(1.00)
     im = im.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=2))
-
     fd, path = tempfile.mkstemp(suffix=".jpg"); os.close(fd)
     im.save(path, "JPEG", quality=95, optimize=True)
     return path
